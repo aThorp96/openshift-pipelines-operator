@@ -22,7 +22,9 @@ import (
 	mf "github.com/manifestival/manifestival"
 	"github.com/tektoncd/operator/pkg/apis/operator/v1alpha1"
 	"github.com/tektoncd/operator/pkg/reconciler/common"
+	"github.com/tektoncd/operator/pkg/reconciler/openshift"
 	occommon "github.com/tektoncd/operator/pkg/reconciler/openshift/common"
+	corev1 "k8s.io/api/core/v1"
 )
 
 func OpenShiftExtension(ctx context.Context) common.Extension {
@@ -36,6 +38,12 @@ func (oe openshiftExtension) Transformers(comp v1alpha1.TektonComponent) []mf.Tr
 		occommon.RemoveRunAsUser(),
 		occommon.RemoveRunAsGroup(),
 		occommon.ApplyCABundlesToDeployment,
+		common.DeploymentEnvVars([]corev1.EnvVar{
+			{
+				Name:  "KUEUE_NAMESPACE",
+				Value: openshift.KueueNameSpace,
+			},
+		}),
 	}
 }
 
@@ -49,4 +57,8 @@ func (oe openshiftExtension) PostReconcile(ctx context.Context, tc v1alpha1.Tekt
 
 func (oe openshiftExtension) Finalize(ctx context.Context, tc v1alpha1.TektonComponent) error {
 	return nil
+}
+
+func (oe openshiftExtension) GetPlatformData() string {
+	return ""
 }
