@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/tektoncd/pruner/pkg/config"
@@ -287,6 +288,37 @@ func Test_ValidateTektonConfig_InvalidPipelineOptions(t *testing.T) {
 	assert.Equal(t, "invalid value: InvalidPolicy: spec.pipeline.options.webhookconfigurationoptions.failurePolicy", err.Error())
 }
 
+func Test_ValidateTektonConfig_InvalidManualApprovalOptions(t *testing.T) {
+	invalidPolicy := admissionregistrationv1.FailurePolicyType("InvalidPolicy")
+	sideEffectUnknown := admissionregistrationv1.SideEffectClassUnknown
+	tc := &TektonConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "config",
+			Namespace: "namespace",
+		},
+		Spec: TektonConfigSpec{
+			CommonSpec: CommonSpec{
+				TargetNamespace: "namespace",
+			},
+			Profile: "all",
+			ManualApproval: ManualApproval{
+				Options: AdditionalOptions{
+					WebhookConfigurationOptions: map[string]WebhookConfigurationOptions{
+						"validation.webhook.manualapproval.dev": {
+							FailurePolicy: &invalidPolicy,
+							SideEffects:   &sideEffectUnknown,
+						},
+					},
+				},
+			},
+			Pruner: Prune{Disabled: true},
+		},
+	}
+
+	err := tc.Validate(context.TODO())
+	assert.Equal(t, "invalid value: InvalidPolicy: spec.manualApproval.options.webhookconfigurationoptions.failurePolicy", err.Error())
+}
+
 func Test_ValidateTektonConfig_InvalidTriggerProperties(t *testing.T) {
 
 	tc := &TektonConfig{
@@ -412,4 +444,143 @@ func Test_ValidateTektonConfig_PrunerConfig_Invalid(t *testing.T) {
 
 	err := tc.Validate(context.TODO())
 	assert.ErrorContains(t, err, "pruner config validation failed")
+}
+
+func Test_ValidateTektonConfig_ResultWatcher(t *testing.T) {
+	tc := &TektonConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "config",
+			Namespace: "namespace",
+		},
+		Spec: TektonConfigSpec{
+			CommonSpec: CommonSpec{
+				TargetNamespace: "namespace",
+			},
+			Profile: "all",
+			Pruner:  Prune{Disabled: true},
+			Result: Result{
+				Watcher: ResultsWatcherProperties{
+					LabelSelector: ptr.String("not a valid selector=="),
+				},
+			},
+		},
+	}
+
+	err := tc.Validate(context.TODO())
+	assert.Assert(t, err != nil)
+	assert.ErrorContains(t, err, "spec.result.watcher.label_selector")
+}
+
+// ---------------------------------------------------------------------------
+// NamespaceSyncConfig.validate — namespaceSelector and secretBindings
+// ---------------------------------------------------------------------------
+
+func makeSyncTC(ns *NamespaceSyncConfig) *TektonConfig {
+	return &TektonConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: ConfigResourceName},
+		Spec: TektonConfigSpec{
+			CommonSpec: CommonSpec{TargetNamespace: "tekton-pipelines"},
+			Profile:    "all",
+			Pruner:     Prune{Disabled: true},
+			Platforms: Platforms{
+				OpenShift: OpenShift{NamespaceSync: ns},
+			},
+		},
+	}
+}
+
+func Test_ValidateNamespaceSyncConfig_ValidNamespaceSelector(t *testing.T) {
+	tc := makeSyncTC(&NamespaceSyncConfig{
+		NamespaceSelector: &metav1.LabelSelector{
+			MatchLabels: map[string]string{"pipelines.openshift.io/sync": "true"},
+		},
+	})
+	// Only run this test on OpenShift; on Kubernetes the namespaceSync block is rejected
+	// by the platform check, not the selector check.
+	t.Setenv("PLATFORM", "openshift")
+	err := tc.Validate(context.TODO())
+	if err != nil {
+		// ignore platform-unrelated errors (SCC cluster calls, etc.)
+		assert.Assert(t, !containsFieldError(err, "namespaceSelector"),
+			"unexpected namespaceSelector error: %v", err)
+	}
+}
+
+func Test_ValidateNamespaceSyncConfig_MalformedNamespaceSelector(t *testing.T) {
+	tc := makeSyncTC(&NamespaceSyncConfig{
+		NamespaceSelector: &metav1.LabelSelector{
+			MatchExpressions: []metav1.LabelSelectorRequirement{{
+				Key:      "env",
+				Operator: "NotAnOperator", // invalid
+			}},
+		},
+	})
+	t.Setenv("PLATFORM", "openshift")
+	err := tc.Validate(context.TODO())
+	assert.Assert(t, err != nil, "expected validation error for malformed namespaceSelector")
+	assert.ErrorContains(t, err, "namespaceSelector")
+}
+
+func Test_ValidateNamespaceSyncConfig_MalformedNamespaceSelectorInOperator(t *testing.T) {
+	tc := makeSyncTC(&NamespaceSyncConfig{
+		NamespaceSelector: &metav1.LabelSelector{
+			MatchExpressions: []metav1.LabelSelectorRequirement{{
+				Key:      "env",
+				Operator: metav1.LabelSelectorOpIn,
+				Values:   []string{}, // In with empty values is invalid
+			}},
+		},
+	})
+	t.Setenv("PLATFORM", "openshift")
+	err := tc.Validate(context.TODO())
+	assert.Assert(t, err != nil, "expected validation error for In with empty values")
+	assert.ErrorContains(t, err, "namespaceSelector")
+}
+
+func Test_ValidateNamespaceSyncConfig_SecretBindingMalformedLabelSelector(t *testing.T) {
+	tc := makeSyncTC(&NamespaceSyncConfig{
+		SecretBindings: []SecretBinding{{
+			LabelSelector: &metav1.LabelSelector{
+				MatchExpressions: []metav1.LabelSelectorRequirement{{
+					Key:      "quay.io/secret",
+					Operator: "BadOperator", // invalid
+				}},
+			},
+		}},
+	})
+	t.Setenv("PLATFORM", "openshift")
+	err := tc.Validate(context.TODO())
+	assert.Assert(t, err != nil, "expected validation error for malformed secretBindings labelSelector")
+	assert.ErrorContains(t, err, "secretBindings[0].labelSelector")
+}
+
+func Test_ValidateNamespaceSyncConfig_SecretBindingBothFieldsSet(t *testing.T) {
+	tc := makeSyncTC(&NamespaceSyncConfig{
+		SecretBindings: []SecretBinding{{
+			SecretName:    "my-secret",
+			LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "x"}},
+		}},
+	})
+	t.Setenv("PLATFORM", "openshift")
+	err := tc.Validate(context.TODO())
+	assert.Assert(t, err != nil, "expected validation error when both secretName and labelSelector are set")
+	assert.ErrorContains(t, err, "secretBindings[0]")
+}
+
+func Test_ValidateNamespaceSyncConfig_SecretBindingNeitherFieldSet(t *testing.T) {
+	tc := makeSyncTC(&NamespaceSyncConfig{
+		SecretBindings: []SecretBinding{{}},
+	})
+	t.Setenv("PLATFORM", "openshift")
+	err := tc.Validate(context.TODO())
+	assert.Assert(t, err != nil, "expected validation error when neither secretName nor labelSelector is set")
+	assert.ErrorContains(t, err, "secretBindings[0]")
+}
+
+// containsFieldError reports whether any error in the FieldError tree mentions the given path fragment.
+func containsFieldError(err *apis.FieldError, pathFragment string) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), pathFragment)
 }

@@ -47,7 +47,6 @@ type TektonPruner struct {
 
 type TektonPrunerConfig struct {
 	// +kubebuilder:pruning:PreserveUnknownFields
-	// +kubebuilder:validation:Schemaless
 	GlobalConfig *config.GlobalConfig `json:"global-config"`
 }
 
@@ -76,6 +75,10 @@ type TektonPrunerSpec struct {
 	// Config holds the configuration for resources created by TektonPruner
 	// +optional
 	Config Config `json:"config,omitempty"`
+	// NetworkPolicy configures NetworkPolicy creation for the controller
+	// and webhook workloads deployed by TektonPruner.
+	// +optional
+	NetworkPolicy NetworkPolicyConfig `json:"networkPolicy,omitempty"`
 }
 
 // TektonPrunerStatus defines the observed state of TektonPruner
@@ -111,5 +114,8 @@ func (p *Pruner) IsDisabled() bool {
 
 func (in *TektonPrunerConfig) DeepCopyInto(out *TektonPrunerConfig) {
 	*out = *in
-	return
+	if in.GlobalConfig != nil {
+		out.GlobalConfig = new(config.GlobalConfig)
+		*out.GlobalConfig = *in.GlobalConfig
+	}
 }

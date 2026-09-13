@@ -48,9 +48,16 @@ type ManualApprovalGate struct {
 type ManualApprovalGateSpec struct {
 	CommonSpec     `json:",inline"`
 	ManualApproval `json:",inline"`
+	// NetworkPolicy configures NetworkPolicy creation for the controller
+	// and webhook workloads deployed by ManualApprovalGate.
+	// +optional
+	NetworkPolicy NetworkPolicyConfig `json:"networkPolicy,omitempty"`
 }
 
 type ManualApproval struct {
+	// enable or disable manual approval gate feature
+	// +optional
+	Disabled *bool `json:"disabled,omitempty"`
 	// options holds additions fields and these fields will be updated on the manifests
 	// +optional
 	Options AdditionalOptions `json:"options"`

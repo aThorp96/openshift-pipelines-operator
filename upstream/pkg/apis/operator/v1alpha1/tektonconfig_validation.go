@@ -81,6 +81,10 @@ func (tc *TektonConfig) Validate(ctx context.Context) (errs *apis.FieldError) {
 		errs = errs.Also(tc.Spec.Platforms.Kubernetes.PipelinesAsCode.PACSettings.validate(logger, "spec.platforms.kubernetes.pipelinesAsCode"))
 	}
 
+	if IsOpenShiftPlatform() && tc.Spec.Platforms.OpenShift.NamespaceSync != nil {
+		errs = errs.Also(tc.Spec.Platforms.OpenShift.NamespaceSync.validate("spec.platforms.openshift.namespaceSync"))
+	}
+
 	// validate SCC config
 	if IsOpenShiftPlatform() && tc.Spec.Platforms.OpenShift.SCC != nil {
 		defaultSCC := PipelinesSCC
@@ -101,24 +105,34 @@ func (tc *TektonConfig) Validate(ctx context.Context) (errs *apis.FieldError) {
 		maxAllowedSCC := tc.Spec.Platforms.OpenShift.SCC.MaxAllowed
 		if maxAllowedSCC != "" {
 			// verify maxAllowed SCC exists on the cluster
-			if err := verifySCCExists(ctx, maxAllowedSCC); err != nil {
-				errs = errs.Also(apis.ErrGeneric(fmt.Sprintf("error verifying SCC exists: %s - %v", maxAllowedSCC, err), "spec.platforms.openshift.scc.maxAllowed"))
+			// we don't want to verify pipelines-scc here as it will be created
+			// later when the RBAC reconciler will be run
+			if maxAllowedSCC != PipelinesSCC {
+				if err := verifySCCExists(ctx, maxAllowedSCC); err != nil {
+					errs = errs.Also(apis.ErrGeneric(fmt.Sprintf("error verifying SCC exists: %s - %v", maxAllowedSCC, err), "spec.platforms.openshift.scc.maxAllowed"))
+				}
 			}
 
 			// Check that maxAllowed SCC and default SCC are compatible wrt priority
-			hasPriority, err := compareSCCAMoreRestrictiveThanB(ctx, defaultSCC, maxAllowedSCC)
-			if err != nil {
-				errs = errs.Also(apis.ErrGeneric(fmt.Sprintf("error comparing priority between maxAllowed and default SCC in TektonConfig: %v", err), "spec.platforms.openshift.scc.maxAllowed"))
-			} else if !hasPriority {
-				errs = errs.Also(apis.ErrGeneric(fmt.Sprintf("maxAllowed SCC (%s) must be less restrictive than the default SCC (%s)", maxAllowedSCC, defaultSCC), "spec.platforms.openshift.scc.maxAllowed"))
+			// Skip this check if either is pipelines-scc (will be created later)
+			if defaultSCC != PipelinesSCC && maxAllowedSCC != PipelinesSCC {
+				hasPriority, err := compareSCCAMoreRestrictiveThanB(ctx, defaultSCC, maxAllowedSCC)
+				if err != nil {
+					errs = errs.Also(apis.ErrGeneric(fmt.Sprintf("error comparing priority between maxAllowed and default SCC in TektonConfig: %v", err), "spec.platforms.openshift.scc.maxAllowed"))
+				} else if !hasPriority {
+					errs = errs.Also(apis.ErrGeneric(fmt.Sprintf("maxAllowed SCC (%s) must be less restrictive than the default SCC (%s)", maxAllowedSCC, defaultSCC), "spec.platforms.openshift.scc.maxAllowed"))
+				}
 			}
 
 			// Now validate maxAllowed SCC config with namespaces
-			sccErrors, err := compareSCCsWithAllNamespaces(ctx, maxAllowedSCC)
-			if err != nil {
-				errs = errs.Also(apis.ErrGeneric(fmt.Sprintf("error comparing priority between maxAllowed and SCCs requested in all namespaces: %v", err), "spec.platforms.openshift.scc.maxAllowed"))
+			// Skip this check if maxAllowed is pipelines-scc (will be created later)
+			if maxAllowedSCC != PipelinesSCC {
+				sccErrors, err := compareSCCsWithAllNamespaces(ctx, maxAllowedSCC)
+				if err != nil {
+					errs = errs.Also(apis.ErrGeneric(fmt.Sprintf("error comparing priority between maxAllowed and SCCs requested in all namespaces: %v", err), "spec.platforms.openshift.scc.maxAllowed"))
+				}
+				errs = errs.Also(sccErrors)
 			}
-			errs = errs.Also(sccErrors)
 		}
 	}
 
@@ -134,19 +148,16 @@ func (tc *TektonConfig) Validate(ctx context.Context) (errs *apis.FieldError) {
 		errs = errs.Also(validateAddonParams(tc.Spec.Addon.Params, "spec.addon.params"))
 	}
 
-	if !tc.Spec.Hub.IsEmpty() {
-		errs = errs.Also(validateHubParams(tc.Spec.Hub.Params, "spec.hub.params"))
-	}
-
 	errs = errs.Also(tc.Spec.Pipeline.PipelineProperties.validate("spec.pipeline"))
 
 	errs = errs.Also(tc.Spec.Pipeline.Options.validate("spec.pipeline.options"))
-	errs = errs.Also(tc.Spec.Hub.Options.validate("spec.hub.options"))
 	errs = errs.Also(tc.Spec.Dashboard.Options.validate("spec.dashboard.options"))
 	errs = errs.Also(tc.Spec.Chain.Options.validate("spec.chain.options"))
 	errs = errs.Also(tc.Spec.Trigger.Options.validate("spec.trigger.options"))
 	errs = errs.Also(tc.Spec.Result.Options.validate("spec.result.options"))
+	errs = errs.Also(tc.Spec.Result.Watcher.Validate("spec.result.watcher"))
 	errs = errs.Also(tc.Spec.MulticlusterProxyAAE.Options.validate("spec.multiclusterProxyAAE.options"))
+	errs = errs.Also(tc.Spec.ManualApproval.Options.validate("spec.manualApproval.options"))
 
 	return errs.Also(tc.Spec.Trigger.TriggersProperties.validate("spec.trigger"))
 }
@@ -200,7 +211,48 @@ func isValueInArray(arr []string, key string) bool {
 }
 
 func isOpenShiftPlatformsSectionSet(o OpenShift) bool {
-	return o.PipelinesAsCode != nil || o.SCC != nil
+	return o.PipelinesAsCode != nil || o.SCC != nil || o.NamespaceSync != nil
+}
+
+func (ns *NamespaceSyncConfig) validate(path string) *apis.FieldError {
+	var errs *apis.FieldError
+
+	// Validate namespaceSelector is a well-formed label selector.
+	if ns.NamespaceSelector != nil {
+		if _, err := metav1.LabelSelectorAsSelector(ns.NamespaceSelector); err != nil {
+			errs = errs.Also(apis.ErrGeneric(
+				fmt.Sprintf("invalid label selector: %v", err),
+				path+".namespaceSelector",
+			))
+		}
+	}
+
+	for i, b := range ns.SecretBindings {
+		errs = errs.Also(b.validate(fmt.Sprintf("%s.secretBindings[%d]", path, i)))
+	}
+	return errs
+}
+
+func (b SecretBinding) validate(path string) *apis.FieldError {
+	hasLabel := b.LabelSelector != nil
+	hasName := b.SecretName != ""
+	if hasLabel && hasName {
+		return apis.ErrMultipleOneOf(path+".labelSelector", path+".secretName")
+	}
+	if !hasLabel && !hasName {
+		return apis.ErrMissingOneOf(path+".labelSelector", path+".secretName")
+	}
+
+	// Validate the label selector is well-formed when present.
+	if hasLabel {
+		if _, err := metav1.LabelSelectorAsSelector(b.LabelSelector); err != nil {
+			return apis.ErrGeneric(
+				fmt.Sprintf("invalid label selector: %v", err),
+				path+".labelSelector",
+			)
+		}
+	}
+	return nil
 }
 
 func isKubernetesPlatformsSectionSet(k Kubernetes) bool {

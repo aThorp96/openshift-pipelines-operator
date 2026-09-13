@@ -53,11 +53,10 @@ const (
 	ChainsImagePrefix               = "IMAGE_CHAINS_"
 	ManualApprovalGatePrefix        = "IMAGE_MAG_"
 	PrunerImagePrefix               = "IMAGE_PRUNER_"
-	SchedulerImagePrefix            = "IMAGE_SCHEDULER_"
+	KueueImagePrefix                = "IMAGE_KUEUE_"
 	MulticlusterProxyAAEImagePrefix = "IMAGE_MULTICLUSTERPROXYAAE_"
 	SyncerServiceImagePrefix        = "IMAGE_SYNCER_SERVICE_WORKLOAD_"
 	ResultsImagePrefix              = "IMAGE_RESULTS_"
-	HubImagePrefix                  = "IMAGE_HUB_"
 	DashboardImagePrefix            = "IMAGE_DASHBOARD_"
 
 	DefaultTargetNamespace = "tekton-pipelines"
@@ -189,19 +188,35 @@ func ImageRegistryDomainOverride(images map[string]string) map[string]string {
 	registry := os.Getenv(ImageRegistryOverride)
 	if registry == "" {
 		return images
-	} else {
-		for key, imageName := range images {
-			parts := strings.Split(imageName, "/")
-			if len(parts) > 1 {
-				// if image has registry part, replace it
-				images[key] = registry + "/" + strings.Join(parts[1:], "/")
-			} else {
-				// if image does not have registry part, add it
-				images[key] = registry + "/" + imageName
-			}
-		}
-		return images
 	}
+	for key, imageName := range images {
+		images[key] = overrideImageRegistry(registry, imageName)
+	}
+	return images
+}
+
+// overrideImageRegistry rewrites the registry domain of a single image
+// reference. It is also used as a fallback by the manifest-level image
+// transformers (containers, task steps, step actions) so that
+// TEKTON_REGISTRY_OVERRIDE alone applies to every image, including the
+// defaults baked into component manifests that have no matching per-image
+// env var.
+func overrideImageRegistry(registry, imageName string) string {
+	if registry == "" || imageName == "" {
+		return imageName
+	}
+	// Tekton variable substitutions (e.g. "$(params.builder-image)") are not
+	// literal image references and must be left untouched.
+	if strings.Contains(imageName, "$(") {
+		return imageName
+	}
+	parts := strings.Split(imageName, "/")
+	if len(parts) > 1 {
+		// if image has registry part, replace it
+		return registry + "/" + strings.Join(parts[1:], "/")
+	}
+	// if image does not have registry part, add it
+	return registry + "/" + imageName
 }
 
 // ToLowerCaseKeys converts key value to lower cases.
@@ -297,22 +312,32 @@ func JobImages(images map[string]string) mf.Transformer {
 }
 
 func replaceContainerImages(containers []corev1.Container, images map[string]string) {
+	registry := os.Getenv(ImageRegistryOverride)
 	for i, container := range containers {
 		name := formKey("", container.Name)
 		if url, exist := images[name]; exist {
 			containers[i].Image = url
+		} else {
+			containers[i].Image = overrideImageRegistry(registry, containers[i].Image)
 		}
 
-		replaceContainersArgsImage(&container, images)
+		replaceContainersArgsImage(&container, images, registry)
 	}
 }
 
-func replaceContainersArgsImage(container *corev1.Container, images map[string]string) {
+// replaceContainersArgsImage replaces image references passed as container
+// args (e.g. "-workingdirinit-image", "gcr.io/..."). If no per-image env var
+// matches a given "*-image*" flag (e.g. "-shell-image-win"), it falls back
+// to rewriting just the registry domain, so TEKTON_REGISTRY_OVERRIDE alone
+// also applies to arg-based images and not only to container.Image.
+func replaceContainersArgsImage(container *corev1.Container, images map[string]string, registry string) {
 	for a, arg := range container.Args {
 		if argVal, hasArg := SplitsByEqual(arg); hasArg {
 			argument := formKey(ArgPrefix, argVal[0])
 			if url, exist := images[argument]; exist {
 				container.Args[a] = argVal[0] + "=" + url
+			} else if strings.Contains(argument, "_image") {
+				container.Args[a] = argVal[0] + "=" + overrideImageRegistry(registry, argVal[1])
 			}
 			continue
 		}
@@ -320,6 +345,8 @@ func replaceContainersArgsImage(container *corev1.Container, images map[string]s
 		argument := formKey(ArgPrefix, arg)
 		if url, exist := images[argument]; exist {
 			container.Args[a+1] = url
+		} else if strings.Contains(argument, "_image") {
+			container.Args[a+1] = overrideImageRegistry(registry, container.Args[a+1])
 		}
 	}
 }
@@ -394,7 +421,10 @@ func replaceStepActionImages(stepActionSpec map[string]interface{}, override map
 	name = formKey("", name)
 	image, found := override[name]
 	if !found || image == "" {
-		logger.Debugf("Image not found in stepaction %s action skip", name)
+		logger.Debugf("Image not found in stepaction %s, applying registry override only", name)
+		if existing, ok := stepActionSpec["image"].(string); ok {
+			stepActionSpec["image"] = overrideImageRegistry(os.Getenv(ImageRegistryOverride), existing)
+		}
 		return
 	}
 	// Replace the image in the stepActionSpec if the key exists.
@@ -416,7 +446,14 @@ func replaceStepsImages(steps []interface{}, override map[string]string, logger 
 		name = formKey("", name)
 		image, found := override[name]
 		if !found || image == "" {
-			logger.Debugf("Image not found step %s action skip", name)
+			logger.Debugf("Image not found step %s, applying registry override only", name)
+			if existing, ok := step["image"].(string); ok {
+				step["image"] = overrideImageRegistry(os.Getenv(ImageRegistryOverride), existing)
+			}
+			continue
+		}
+		if existing, ok := step["image"].(string); ok && (strings.Contains(existing, "$(params.") || strings.Contains(existing, "$(inputs.params.")) {
+			logger.Debugf("Skipping image replacement for step %s, image contains param substitution", name)
 			continue
 		}
 		step["image"] = image
@@ -701,27 +738,48 @@ func InjectLabelOnNamespace(label string) mf.Transformer {
 	}
 }
 
+// AddConfiguration propagates NodeSelector, Tolerations and PriorityClassName from
+// the component Config onto workload pod templates. It handles both Deployment and
+// StatefulSet so that components which run as a StatefulSet natively (e.g. postgres)
+// or switch between the two at runtime (e.g. horizontal scaling via StatefulsetOrdinals)
+// are covered without depending on transformer ordering.
 func AddConfiguration(config v1alpha1.Config) mf.Transformer {
+	applyConfig := func(spec *corev1.PodSpec) {
+		spec.NodeSelector = config.NodeSelector
+		spec.Tolerations = config.Tolerations
+		spec.PriorityClassName = config.PriorityClassName
+	}
+
 	return func(u *unstructured.Unstructured) error {
-		if u.GetKind() != "Deployment" {
-			return nil
-		}
+		switch u.GetKind() {
+		case "Deployment":
+			d := &appsv1.Deployment{}
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, d); err != nil {
+				return err
+			}
 
-		d := &appsv1.Deployment{}
-		err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, d)
-		if err != nil {
-			return err
-		}
+			applyConfig(&d.Spec.Template.Spec)
 
-		d.Spec.Template.Spec.NodeSelector = config.NodeSelector
-		d.Spec.Template.Spec.Tolerations = config.Tolerations
-		d.Spec.Template.Spec.PriorityClassName = config.PriorityClassName
+			unstrObj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(d)
+			if err != nil {
+				return err
+			}
+			u.SetUnstructuredContent(unstrObj)
 
-		unstrObj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(d)
-		if err != nil {
-			return err
+		case "StatefulSet":
+			s := &appsv1.StatefulSet{}
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, s); err != nil {
+				return err
+			}
+
+			applyConfig(&s.Spec.Template.Spec)
+
+			unstrObj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(s)
+			if err != nil {
+				return err
+			}
+			u.SetUnstructuredContent(unstrObj)
 		}
-		u.SetUnstructuredContent(unstrObj)
 
 		return nil
 	}

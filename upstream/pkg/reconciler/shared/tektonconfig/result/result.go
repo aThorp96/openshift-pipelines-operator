@@ -140,8 +140,18 @@ func UpdateResult(ctx context.Context, old *v1alpha1.TektonResult, new *v1alpha1
 		updated = true
 	}
 
+	if !reflect.DeepEqual(old.Spec.Watcher, new.Spec.Watcher) {
+		old.Spec.Watcher = new.Spec.Watcher
+		updated = true
+	}
+
 	if !reflect.DeepEqual(old.Spec.Config, new.Spec.Config) {
 		old.Spec.Config = new.Spec.Config
+		updated = true
+	}
+
+	if !reflect.DeepEqual(old.Spec.NetworkPolicy, new.Spec.NetworkPolicy) {
+		old.Spec.NetworkPolicy = new.Spec.NetworkPolicy
 		updated = true
 	}
 
@@ -185,8 +195,8 @@ func GetTektonResultCR(config *v1alpha1.TektonConfig, operatorVersion string) *v
 
 	// For Hub clusters (multicluster enabled AND role is Hub), set replicas to 0
 	// for watcher and retention-policy-agent deployments
-	if !config.Spec.Scheduler.MultiClusterDisabled &&
-		strings.EqualFold(string(config.Spec.Scheduler.MultiClusterRole), string(v1alpha1.MultiClusterRoleHub)) {
+	if !config.Spec.Kueue.MultiClusterDisabled &&
+		strings.EqualFold(string(config.Spec.Kueue.MultiClusterRole), string(v1alpha1.MultiClusterRoleHub)) {
 		result = disableWatcherAndRetentionAgentOnHubCluster(result)
 	}
 
@@ -202,8 +212,9 @@ func GetTektonResultCR(config *v1alpha1.TektonConfig, operatorVersion string) *v
 			CommonSpec: v1alpha1.CommonSpec{
 				TargetNamespace: config.Spec.TargetNamespace,
 			},
-			Result: result,
-			Config: config.Spec.Config,
+			Result:        result,
+			Config:        config.Spec.Config,
+			NetworkPolicy: config.Spec.NetworkPolicy,
 		},
 	}
 }

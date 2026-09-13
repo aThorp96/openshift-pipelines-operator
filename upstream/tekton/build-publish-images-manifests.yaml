@@ -80,7 +80,7 @@ spec:
   steps:
 
   - name: container-registy-auth
-    image: cgr.dev/chainguard/crane:latest-dev@sha256:6fc6fcdeb173c7951f038e6a7b230f586c1be05a011d9e6f9db6c614ec412c2f
+    image: cgr.dev/chainguard/crane:latest-dev@sha256:8f40a0a119ec8054691e048027bc601039f613c7ebd452cba60aa0539a68b096
     script: |
       #!/bin/sh
       set -ex
@@ -99,7 +99,7 @@ spec:
       cp ${DOCKER_CONFIG} /workspace/${KUBE_DISTRO}-docker-config.json
 
   - name: rewrite-devel-in-source
-    image: ghcr.io/tektoncd/plumbing/ko-gcloud:v20240920-6c2a999d36@sha256:1756ca55a09b360028695792e638a7cc366292d7aef44c926a8cb765085664c8
+    image: ghcr.io/tektoncd/plumbing/ko@sha256:d5b1f55955363c20e01c27f940692df77bf5520103012446af9900ac681fbc8c
     script: |
       #!/usr/bin/env sh
       set -ex
@@ -120,7 +120,7 @@ spec:
       fi
 
   - name: run-kustomize-ko
-    image: ghcr.io/tektoncd/plumbing/ko-gcloud:v20240920-6c2a999d36@sha256:1756ca55a09b360028695792e638a7cc366292d7aef44c926a8cb765085664c8
+    image: ghcr.io/tektoncd/plumbing/ko@sha256:d5b1f55955363c20e01c27f940692df77bf5520103012446af9900ac681fbc8c
     env:
     - name: KO_DOCKER_REPO
       value: $(params.imageRegistry)/$(params.imageRegistryPath)
@@ -147,11 +147,15 @@ spec:
       # probably get it wrong), we'll just targz up the whole vendor tree and
       # include it. As of 9/20/2019, this amounts to about 11MB of additional
       # data in each image.
+      # ko >= v0.19.0 rejects kodata symlinks that resolve outside the
+      # kodata root (ko-build/ko#1619), so the tarball is copied into
+      # each kodata/ directory instead of being symlinked from a
+      # shared tmpdir.
       TMPDIR=$(mktemp -d)
       tar cfz ${TMPDIR}/source.tar.gz vendor/
       for d in cmd/${KUBE_DISTRO}/*; do
         if [ -d ${d}/kodata/ ]; then
-          ln -s ${TMPDIR}/source.tar.gz ${d}/kodata/
+          cp ${TMPDIR}/source.tar.gz ${d}/kodata/
         fi
       done
 
@@ -182,7 +186,7 @@ spec:
       sed -i -E -e 's/(app.kubernetes.io\/version): "?devel"?/\1: "$(params.versionTag)"/g' -e 's/(operator.tekton.dev\/release): "?devel"?/\1: "$(params.versionTag)"/g' -e 's/(version): "?devel"?/\1: "$(params.versionTag)"/g' ${OUTPUT_RELEASE_DIR}/${FILENAME_PREFIX}release.yaml
       sed -i -E -e 's/(app.kubernetes.io\/version): "?devel"?/\1: "$(params.versionTag)"/g' -e 's/(operator.tekton.dev\/release): "?devel"?/\1: "$(params.versionTag)"/g' -e 's/(version): "?devel"?/\1: "$(params.versionTag)"/g' ${OUTPUT_RELEASE_DIR}/${FILENAME_PREFIX}release.notags.yaml
   - name: koparse
-    image: ghcr.io/tektoncd/plumbing/koparse@sha256:194c2ab9dce5f778ed757af13c626d6b85f15452e2c2902c79b0d0f5a0adf4d1
+    image: ghcr.io/tektoncd/plumbing/koparse@sha256:dc202b2d066bb4453bf36a0d7b8e6242d52e9516313bb0026d5633b1efe44d29
     script: |
       set -ex
 
@@ -216,7 +220,7 @@ spec:
         ${PRESERVE_IMPORT_PATH} > /workspace/built_images
 
   - name: tag-images
-    image: cgr.dev/chainguard/crane:latest-dev@sha256:6fc6fcdeb173c7951f038e6a7b230f586c1be05a011d9e6f9db6c614ec412c2f
+    image: cgr.dev/chainguard/crane:latest-dev@sha256:8f40a0a119ec8054691e048027bc601039f613c7ebd452cba60aa0539a68b096
     script: |
       #!/bin/sh
       set -ex

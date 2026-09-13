@@ -19,13 +19,14 @@ Other than the above components depending on the platform operator also provides
 - On both Kubernetes and OpenShift
   - [TektonChain](./TektonChain.md)
   - [TektonResult](./TektonResult.md)
+  - [ManualApprovalGate](./ManualApprovalGate.md)
 - On Kubernetes
   - [TektonDashboard](./TektonDashboard.md)
   - [OpenShiftPipelinesAsCode](./OpenShiftPipelinesAsCode.md) (installed via `spec.platforms.kubernetes.pipelinesAsCode`; same CRD/kind as on OpenShift)
 - On OpenShift
   - [TektonAddon](./TektonAddon.md)
   - [OpenShiftPipelinesAsCode](./OpenShiftPipelinesAsCode.md)
-- When scheduler multi-cluster is enabled with Hub role (both Kubernetes and OpenShift)
+- When Tekton Kueue multi-cluster is enabled with Hub role (both Kubernetes and OpenShift)
   - [TektonMulticlusterProxyAAE](./TektonMulticlusterProxyAAE.md)
 
 The TektonConfig CR provides the following features
@@ -47,6 +48,8 @@ spec:
     priorityClassName: system-cluster-critical
   chain:
     disabled: false
+  manualApproval:
+    disabled: true
   pipeline:
     await-sidecar-readiness: true
     coschedule: workspaces
@@ -104,15 +107,6 @@ spec:
     # keep-since: 1440
     # NOTE: you can use either "keep" or "keep-since", not both
     prune-per-resource: true
-  hub:
-    params:
-      - name: enable-devconsole-integration
-        value: "true"
-    options:
-      disabled: false
-      configMaps: {}
-      deployments: {}
-      webhookConfigurationOptions: {}
   dashboard:
     readonly: true
     options:
@@ -292,6 +286,7 @@ chain:
   storage.gcs.bucket: #value
   storage.oci.repository: #value
   storage.oci.repository.insecure: #value (boolean - true/false)
+  storage.oci.encoding-format: #value (dsse or sigstore-bundle, default: dsse)
   storage.docdb.url: #value
   storage.grafeas.projectid: #value
   storage.grafeas.noteid: #value
@@ -313,6 +308,23 @@ chain:
   transparency.enabled: #value (boolean - true/false)
   transparency.url: #value
 ```
+
+### Manual Approval Gate
+
+Manual Approval Gate section allows user to enable or disable the [ManualApprovalGate](./ManualApprovalGate.md) component through TektonConfig. When enabled, the operator installs and manages the ManualApprovalGate CR automatically.
+
+Example:
+
+```yaml
+manualApproval:
+  disabled: true # - `disabled` : if the value set as `true`, ManualApprovalGate will not be installed (default: `true`)
+  options:
+    disabled: false
+    deployments: {}
+```
+
+- `disabled`: if set to `true`, the ManualApprovalGate component will not be installed. Default is `true` (disabled).
+- `options`: allows customizing the ManualApprovalGate deployments and configmaps. See [Additional fields as options](#additional-fields-as-options) for details.
 
 ### Result
 
@@ -358,7 +370,61 @@ result:
   loki_stack_namespace: #optional
   prometheus_port: 9090
   prometheus_histogram: false
+  watcher:
+    completed_run_grace_period: 24h
+    check_owner: true
+    store_deadline: 10m
+    disable_storing_incomplete_runs: true
 ```
+
+#### Tekton Results Watcher configuration
+
+Watcher-specific settings are configured under `result.watcher`. These map to command-line flags on the `tekton-results-watcher` deployment. See [Results Watcher documentation](https://tekton.dev/docs/results/watcher/) for behavior details.
+
+Not every watcher flag is exposed under `result.watcher`:
+- Performance flags (`threadiness`, `qps`, `burst`, `disable-ha`) are configured under `result.performance`.
+- Operator-managed flags (`api_addr`, `auth_mode`, `namespace`) are set by the operator and must not be overridden.
+- Secrets (`token`) must not be stored in the CR; use Secrets / `auth_mode` instead.
+
+For optional string fields (`summary_labels`, `summary_annotations`, `label_selector`):
+- omit the field to keep the watcher binary default
+- set a non-empty value to override
+- set `""` to clear the default (operator passes an empty flag value)
+
+Example:
+
+```yaml
+result:
+  disabled: false
+  watcher:
+    completed_run_grace_period: 24h
+    check_owner: true
+    store_deadline: 10m
+    disable_storing_incomplete_runs: true
+    logs_api: true
+    logs_timestamps: false
+    store_event: false
+    summary_labels: tekton.dev/pipeline
+    label_selector: ""
+```
+
+| Field | Watcher flag | Default | Description |
+|---|---|---|---|
+| `completed_run_grace_period` | `-completed_run_grace_period` | `0` | Time after completion before deleting Runs from the cluster. `0` disables deletion. |
+| `check_owner` | `-check_owner` | `true` | Skip deletion when the Run has owner references. |
+| `store_deadline` | `-store_deadline` | `10m` | Max wait to store a Run before clearing its finalizer on delete. |
+| `disable_storing_incomplete_runs` | `-disable_storing_incomplete_runs` | `false` | Only store Runs after they complete. |
+| `logs_api` | `-logs_api` | `false` | Send logs to the Results API (separate from API server `logs_api`). |
+| `logs_timestamps` | `-logs_timestamps` | `false` | Include timestamps in stored logs. |
+| `store_event` | `-store_event` | `false` | Store Kubernetes events related to Runs. |
+| `summary_labels` | `-summary_labels` | `tekton.dev/pipeline` | Comma-separated labels copied into Result summary. Omit to keep default; `""` clears it. |
+| `summary_annotations` | `-summary_annotations` | `""` | Comma-separated annotations copied into Result summary. Omit to keep default; `""` clears it. |
+| `label_selector` | `-label_selector` | `""` | Label selector for Runs eligible for post-grace deletion. Omit to keep default; `""` clears it. |
+| `requeue_interval` | `-requeue_interval` | `10m` | Requeue delay for certain watcher events. |
+| `forward_buffer` | `-forward_buffer` | `150s` | Wait time for log forwarder after TaskRun completion. |
+| `update_log_timeout` | `-update_log_timeout` | `300s` | Timeout for log storage operations. |
+| `dynamic_reconcile_timeout` | `-dynamic_reconcile_timeout` | `30s` | Timeout for dynamic reconciler processing. |
+| `disable_crd_update` | `-disable_crd_update` | `false` | Disable Tekton CRD annotation updates during reconcile. |
 
 User can configure custom database secret name for internal/external database via Tekton Config CR.
 
@@ -420,33 +486,39 @@ By default pruner job will be created from the global pruner config (`spec.prune
 >
 > if a global value is not present the following values will be consider as default value <br> > `resources: pipelinerun` <br> > `keep: 100` <br>
 
-### Scheduler
+### Tekton Kueue
 
-Scheduler section allows you to install and manage the [Tekton Scheduler](./TektonScheduler.md) through TektonConfig. The Scheduler component uses [Kueue](https://kueue.sigs.k8s.io) and [cert-manager](https://github.com/cert-manager/cert-manager); you must install Kueue and cert-manager CRDs before enabling the scheduler. For full pre-requisites and multi-cluster configuration details, see [Tekton Scheduler](./TektonScheduler.md).
+The `spec.kueue` section allows you to install and manage the [Tekton Kueue](./TektonKueue.md) through TektonConfig. The Tekton Kueue component uses [Kueue](https://kueue.sigs.k8s.io) and [cert-manager](https://github.com/cert-manager/cert-manager); you must install Kueue and cert-manager CRDs before enabling Tekton Kueue. For full pre-requisites and multi-cluster configuration details, see [Tekton Kueue](./TektonKueue.md).
 
-Scheduler can be enabled by setting `disabled` to `false` in the scheduler section. If you are working with multi-cluster pipelines, you can enable multi-cluster from the scheduler config. In a multi-cluster environment a cluster can play the role of **Hub** or **Spoke**. The TektonConfig settings for Scheduler for Hub and Spoke are defined below.
+The deprecated `spec.scheduler` field is migrated automatically to `spec.kueue` during pre-upgrade reconciliation. If both fields are configured, `spec.kueue` takes precedence.
+
+Tekton Kueue can be enabled by setting `disabled` to `false` in the kueue section. If you are working with multi-cluster pipelines, you can enable multi-cluster from the kueue config. In a multi-cluster environment a cluster can play the role of **Hub** or **Spoke**. The TektonConfig settings for Tekton Kueue for Hub and Spoke are defined below.
 
 #### Hub cluster
 
 ```yaml
-scheduler:
+kueue:
   disabled: false
   multi-cluster-disabled: false
   multi-cluster-role: Hub
+  config.yaml:
+    queueName: pipelines-queue
   options: {}
 ```
 
 #### Spoke cluster
 
 ```yaml
-scheduler:
+kueue:
   disabled: false
   multi-cluster-disabled: false
   multi-cluster-role: Spoke
+  config.yaml:
+    queueName: pipelines-queue
   options: {}
 ```
 
-- `disabled`: set to `false` to enable the Scheduler component (default is `true`).
+- `disabled`: set to `false` to enable the Tekton Kueue component (default is `true`).
 - `multi-cluster-disabled`: when `false`, multi-cluster features are enabled (default is `true`).
 - `multi-cluster-role`: `Hub` or `Spoke`. When set to **Hub**, TektonConfig also creates and manages the [TektonMulticlusterProxyAAE](./TektonMulticlusterProxyAAE.md) component automatically (the proxy is used to communicate with spoke clusters, e.g. for [Kueue MultiKueue](https://kueue.sigs.k8s.io/docs/concepts/multikueue/)). On spoke clusters use `Spoke`; the proxy is not installed there.
 
@@ -495,21 +567,6 @@ addon:
 
 **NOTE**: TektonAddon is currently available for OpenShift Platform only. Enabling this for Kubernetes platform is in roadmap
 of Operator.
-
-### Hub
-
-This is to enable/disable showing hub resources in pipeline builder of devconsole(OpenShift UI). By default, the field is
-not there in the config object. If you want to disable the integration, you can add the param like below in config with value `false`.
-The possible values are `true` and `false`.
-
-Example:
-
-```yaml
-hub:
-  params:
-    - name: enable-devconsole-integration
-      value: "false"
-```
 
 ### Dashboard
 
@@ -574,6 +631,137 @@ In the deployment the environment name will be converted as follows,
 
 - `tekton-hub-api` => `TEKTON_HUB_API`
 - `artifact-hub-api` => `ARTIFACT_HUB_API`
+
+### NamespaceSync (OpenShift only)
+
+The `namespaceSync` block under `spec.platforms.openshift` controls the **NamespaceSyncController**, which watches every user namespace and ensures Tekton-required resources are present and up to date. It replaces the legacy per-namespace batch loop that was part of the RBAC reconciler.
+
+#### Resources managed per namespace
+
+| Resource | Kind | Purpose |
+|---|---|---|
+| `pipeline` | `ServiceAccount` | Identity for PipelineRun pods |
+| `pipelines-scc-rolebinding` | `RoleBinding` → `pipelines-scc-clusterrole` | Grants the pipeline SA permission to use the default SCC |
+| `openshift-pipelines-edit` | `RoleBinding` → `ClusterRole/edit` | Gives the pipeline SA edit access within its namespace |
+| `config-trusted-cabundle` | `ConfigMap` | CA bundle for custom/internal PKI trust |
+| `config-service-cabundle` | `ConfigMap` | OpenShift service CA bundle |
+| `openshift-pipelines-clusterinterceptors` | `ClusterRoleBinding` subject | Lets the pipeline SA call ClusterInterceptors |
+
+#### Configuration fields
+
+```yaml
+spec:
+  platforms:
+    openshift:
+      namespaceSync:
+        createPipelineSA: true          # create/maintain the pipeline SA
+        createSCCRoleBinding: true      # create/maintain pipelines-scc-rolebinding
+        createEditRoleBinding: true     # create/maintain openshift-pipelines-edit
+        createCABundles: true           # inject CA bundle ConfigMaps
+
+        # Optional: restrict which namespaces are synced.
+        # Omit entirely (or set to {}) to sync all non-system namespaces (default).
+        # Use matchLabels/matchExpressions to restrict to a subset.
+        namespaceSelector:
+          matchLabels:
+            pipelines.openshift.io/sync: "true"
+
+        # Optional: automatically bind secrets to the pipeline SA.
+        # Use secretName for an exact name, or labelSelector to match by label.
+        secretBindings:
+          - secretName: pipeline-quay-openshift     # Quay Bridge robot account secret
+          - labelSelector:
+              matchLabels:
+                quay-integration: my-quay            # all secrets with this label
+```
+
+All boolean fields default to `true` when the `namespaceSync` block is present.
+
+#### Disabling individual features
+
+Set the flag to `false` to stop managing that resource class. Existing resources
+are **not deleted** — the controller simply stops reconciling them:
+
+```yaml
+spec:
+  platforms:
+    openshift:
+      namespaceSync:
+        createEditRoleBinding: false   # do not create openshift-pipelines-edit
+```
+
+#### Restricting sync to specific namespaces
+
+Use `namespaceSelector` to limit which namespaces the controller acts on.
+Label namespaces you want synced, then configure the selector to match:
+
+```bash
+# Label a namespace to opt in
+oc label namespace my-project pipelines.openshift.io/sync=true
+```
+
+```yaml
+spec:
+  platforms:
+    openshift:
+      namespaceSync:
+        namespaceSelector:
+          matchLabels:
+            pipelines.openshift.io/sync: "true"
+```
+
+To disable sync for **all** namespaces while keeping the feature flags intact,
+set all individual flags to `false`:
+
+```yaml
+namespaceSync:
+  createPipelineSA: false
+  createCABundles: false
+  createEditRoleBinding: false
+  createSCCRoleBinding: false
+```
+
+Or remove the `namespaceSync` field entirely to fall back to operator defaults.
+
+#### Quay Bridge secret auto-binding
+
+When the [Quay Bridge Operator](https://github.com/quay/quay-bridge-operator) is
+installed, it creates a robot-account secret named `pipeline-quay-openshift` in
+each namespace. Declare a `secretBinding` to have the NamespaceSyncController
+automatically bind that secret to the `pipeline` SA as an image pull secret:
+
+```yaml
+spec:
+  platforms:
+    openshift:
+      namespaceSync:
+        secretBindings:
+          - secretName: pipeline-quay-openshift
+```
+
+Once configured:
+- When the secret appears in a namespace it is added to both `imagePullSecrets`
+  and `secrets` on the `pipeline` SA within seconds.
+- When the secret is deleted the reference is removed automatically.
+
+#### Migration from legacy `spec.params`
+
+Older releases controlled this behaviour through `spec.params` entries. These
+are deprecated: the operator continues to honor them for backward
+compatibility, but they should be migrated to the typed fields below. The
+operator automatically migrates and persists them during the first
+reconcile after an upgrade:
+
+| Legacy `spec.params` | Typed field |
+|---|---|
+| `createRbacResource: "false"` | `createPipelineSA`, `createSCCRoleBinding`, `createEditRoleBinding` all set to `false` |
+| `createCABundleConfigMaps: "false"` | `createCABundles: false` |
+| `legacyPipelineRbac: "false"` | `createEditRoleBinding: false` |
+
+After migration the legacy params are removed from `spec.params` and the typed
+fields take effect. There is no need to manually update the TektonConfig CR.
+
+---
 
 ### OpenShiftPipelinesAsCode
 
@@ -793,6 +981,12 @@ There is a field called `options` available in all the components.<br>
 > **NOTE:** There is a possibility to have two different values for a field.<br>
 > An example: with a pre-defined field you can set value and the same field may be defined under `options` as well. In that case value from `options` will be final.
 
+> **NOTE:** The embedded objects are not merged as a whole. The operator copies a
+> known set of fields onto the manifest, and the per-kind lists below are
+> exhaustive - a field outside them is ignored silently, with no error or warning.
+> If a field you set under `options` has no effect, it is most likely not
+> supported yet - please open an issue.
+
 A sample `options` field,
 
 ```yaml
@@ -846,6 +1040,11 @@ options:
           custom-annotation: "foo"
       spec:
         replicas: 2
+        strategy:
+          type: RollingUpdate
+          rollingUpdate:
+            maxSurge: 0
+            maxUnavailable: 1
         template:
           spec:
             containers:
@@ -862,6 +1061,10 @@ options:
           custom-annotation: foo
       spec:
         replicas: 3
+        updateStrategy:
+          type: RollingUpdate
+          rollingUpdate:
+            partition: 1
         template:
           spec:
             containers:
@@ -919,6 +1122,7 @@ The following fields are supported in `deployment`
   - `annotations` - supports add and update
 - `spec`
   - `replicas` - updates deployment replicas count
+  - `strategy` - replaces the existing deployment strategy with this, if `type` is not empty
   - `template`
     - `metadata`
       - `labels` - supports add and update
@@ -953,6 +1157,7 @@ The following fields are supported in `StatefulSet`
   - `annotations` - supports add and update
 - `spec`
   - `replicas` - updates statefulSets replicas count
+  - `updateStrategy` - replaces the existing statefulSet update strategy with this, if `type` is not empty
   - `serviceName` - updates service name
   - `podManagementPolicy` - updates pod management policy
   - `volumeClaimTemplates` - updates volume claim templates
