@@ -29,8 +29,8 @@ resources:
 - config-leader-election.yaml
 - tekton_result_role.yaml
 - tekton_result_role_binding.yaml
-- tekton_scheduler_role.yaml
-- tekton_scheduler_role_binding.yaml
+- tekton_kueue_role.yaml
+- tekton_kueue_role_binding.yaml
 
 # Generated CRDs
 - generated-crds/operator.tekton.dev_manualapprovalgates.yaml
@@ -38,11 +38,13 @@ resources:
 - generated-crds/operator.tekton.dev_syncerservices.yaml
 - generated-crds/operator.tekton.dev_tektonchains.yaml
 - generated-crds/operator.tekton.dev_tektonconfigs.yaml
-- generated-crds/operator.tekton.dev_tektonhubs.yaml
 - generated-crds/operator.tekton.dev_tektoninstallersets.yaml
 - generated-crds/operator.tekton.dev_tektonmulticlusterproxyaaes.yaml
 - generated-crds/operator.tekton.dev_tektonpipelines.yaml
 - generated-crds/operator.tekton.dev_tektonpruners.yaml
 - generated-crds/operator.tekton.dev_tektonresults.yaml
+- generated-crds/operator.tekton.dev_tektonkueues.yaml
 - generated-crds/operator.tekton.dev_tektonschedulers.yaml
+- generated-crds/operator.tekton.dev_tektondashboards.yaml
+- generated-crds/operator.tekton.dev_tektonaddons.yaml
 - generated-crds/operator.tekton.dev_tektontriggers.yaml
