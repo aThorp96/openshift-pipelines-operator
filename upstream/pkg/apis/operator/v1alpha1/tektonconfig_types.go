@@ -59,7 +59,7 @@ type Prune struct {
 	Disabled bool `json:"disabled"`
 	// apply the prune job to the individual resources
 	// +optional
-	PrunePerResource bool `json:"prune-per-resource,omitempty"`
+	PrunePerResource bool `json:"prune-per-resource"`
 	// The resources which need to be pruned
 	Resources []string `json:"resources,omitempty"`
 	// The number of resource to keep
@@ -97,9 +97,13 @@ type TektonConfigSpec struct {
 	Pruner Prune `json:"pruner,omitempty"`
 	// New EventBasedPruner which provides more granular control over TaskRun and PipelineRuns
 	TektonPruner Pruner `json:"tektonpruner,omitempty"`
-	// To enable Pipeline Scheduling on Single Cluster or Multiple Clusters
+	// To enable Pipeline queueing on Single Cluster or Multiple Clusters
 	// +optional
-	Scheduler  Scheduler `json:"scheduler,omitempty"`
+	Kueue Kueue `json:"kueue,omitempty"`
+	// Scheduler is the deprecated predecessor of Kueue. Pre-upgrade migration
+	// copies this configuration to Kueue and clears the field.
+	// +optional
+	Scheduler  Scheduler `json:"scheduler,omitempty,omitzero"`
 	CommonSpec `json:",inline"`
 	// Addon holds the addons config
 	// +optional
@@ -116,6 +120,9 @@ type TektonConfigSpec struct {
 	// Chain holds the customizable option for chains component
 	// +optional
 	Chain Chain `json:"chain,omitempty"`
+	// ManualApproval holds the customizable options for the ManualApprovalGate component
+	// +optional
+	ManualApproval ManualApproval `json:"manualApproval,omitempty"`
 	// Result holds the customize option for results component
 	// +optional
 	Result Result `json:"result,omitempty"`
@@ -135,9 +142,10 @@ type TektonConfigSpec struct {
 	// +optional
 	TargetNamespaceMetadata *NamespaceMetadata `json:"targetNamespaceMetadata,omitempty"`
 	// NetworkPolicy configures NetworkPolicy resources for the operand namespace.
-	// This field is propagated to TektonTrigger, which is the only component with
-	// NetworkPolicy reconciliation implemented. Other components (Pipeline, Chains,
-	// Results, Dashboard) do not yet act on this field.
+	// This field is propagated to TektonPipeline, TektonTrigger, TektonChain,
+	// TektonPruner, TektonResult, Pipelines-as-Code, and MultiCluster components
+	// (TektonKueue, TektonMulticlusterProxyAAE, SyncerService).
+	// Other components (Dashboard) do not yet act on this field.
 	// +optional
 	NetworkPolicy NetworkPolicyConfig `json:"networkPolicy,omitempty"`
 }
@@ -218,4 +226,13 @@ type Platforms struct {
 	// Kubernetes allows configuring kubernetes specific components and configurations
 	// +optional
 	Kubernetes Kubernetes `json:"kubernetes,omitempty"`
+}
+
+type Hub struct {
+	// Params is the list of params passed for Hub customization
+	// +optional
+	Params []Param `json:"params,omitempty"`
+	// options holds additions fields and these fields will be updated on the manifests
+	// +optional
+	Options AdditionalOptions `json:"options,omitempty"`
 }
