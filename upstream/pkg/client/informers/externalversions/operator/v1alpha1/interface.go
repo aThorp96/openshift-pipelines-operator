@@ -38,10 +38,10 @@ type Interface interface {
 	TektonConfigs() TektonConfigInformer
 	// TektonDashboards returns a TektonDashboardInformer.
 	TektonDashboards() TektonDashboardInformer
-	// TektonHubs returns a TektonHubInformer.
-	TektonHubs() TektonHubInformer
 	// TektonInstallerSets returns a TektonInstallerSetInformer.
 	TektonInstallerSets() TektonInstallerSetInformer
+	// TektonKueues returns a TektonKueueInformer.
+	TektonKueues() TektonKueueInformer
 	// TektonMulticlusterProxyAAEs returns a TektonMulticlusterProxyAAEInformer.
 	TektonMulticlusterProxyAAEs() TektonMulticlusterProxyAAEInformer
 	// TektonPipelines returns a TektonPipelineInformer.
@@ -102,14 +102,14 @@ func (v *version) TektonDashboards() TektonDashboardInformer {
 	return &tektonDashboardInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
 }
 
-// TektonHubs returns a TektonHubInformer.
-func (v *version) TektonHubs() TektonHubInformer {
-	return &tektonHubInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
-}
-
 // TektonInstallerSets returns a TektonInstallerSetInformer.
 func (v *version) TektonInstallerSets() TektonInstallerSetInformer {
 	return &tektonInstallerSetInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
+}
+
+// TektonKueues returns a TektonKueueInformer.
+func (v *version) TektonKueues() TektonKueueInformer {
+	return &tektonKueueInformer{factory: v.factory, tweakListOptions: v.tweakListOptions}
 }
 
 // TektonMulticlusterProxyAAEs returns a TektonMulticlusterProxyAAEInformer.
