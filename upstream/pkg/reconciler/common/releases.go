@@ -94,8 +94,6 @@ func ComponentDir(instance v1alpha1.TektonComponent) string {
 		return filepath.Join(koDataDir, "tekton-config")
 	case *v1alpha1.TektonResult:
 		return filepath.Join(koDataDir, "tekton-results")
-	case *v1alpha1.TektonHub:
-		return filepath.Join(koDataDir, "tekton-hub")
 	case *v1alpha1.TektonChain:
 		return filepath.Join(koDataDir, "tekton-chains")
 	case *v1alpha1.ManualApprovalGate:
@@ -106,8 +104,8 @@ func ComponentDir(instance v1alpha1.TektonComponent) string {
 		// Event-based pruner uses "pruner" directory (not "tekton-pruner")
 		// to avoid conflicts with job-based pruner in "tekton-pruner" directory
 		return filepath.Join(koDataDir, "pruner")
-	case *v1alpha1.TektonScheduler:
-		return filepath.Join(koDataDir, "tekton-scheduler")
+	case *v1alpha1.TektonKueue:
+		return filepath.Join(koDataDir, "tekton-kueue")
 	case *v1alpha1.TektonMulticlusterProxyAAE:
 		return filepath.Join(koDataDir, "tekton-multicluster-proxy-aae")
 	case *v1alpha1.SyncerService:

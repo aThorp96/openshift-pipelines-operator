@@ -8,7 +8,7 @@ You may obtain a copy of the License at
     http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" B]>SIS,
+distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
@@ -17,20 +17,23 @@ limitations under the License.
 package tektonresult
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"path"
+	"testing"
+	"time"
 
 	mf "github.com/manifestival/manifestival"
-	"k8s.io/apimachinery/pkg/runtime"
-
-	"fmt"
-	"testing"
-
 	"github.com/tektoncd/operator/pkg/apis/operator/v1alpha1"
 	"github.com/tektoncd/operator/pkg/reconciler/common"
-
 	"gotest.tools/v3/assert"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"knative.dev/pkg/ptr"
 )
 
 func Test_enablePVCLogging(t *testing.T) {
@@ -292,6 +295,56 @@ func TestUpdateAPIEnv(t *testing.T) {
 	assert.Equal(t, true, containerFound, "container not found")
 }
 
+func TestUpdateApiEnvDeterministicOrder(t *testing.T) {
+	testData := path.Join("testdata", "api-deployment.yaml")
+	boolVal := true
+	intVal := int64(12345)
+	spec := v1alpha1.TektonResultSpec{
+		Result: v1alpha1.Result{
+			ResultsAPIProperties: v1alpha1.ResultsAPIProperties{
+				DBHost:                "localhost",
+				DBName:                "test",
+				ServerPort:            &intVal,
+				DBEnableAutoMigration: &boolVal,
+				AuthDisable:           &boolVal,
+				LogLevel:              "warn",
+				LogsAPI:               &boolVal,
+				LogsPath:              "/logs/test",
+				LogsType:              "S3",
+				LogsBufferSize:        &intVal,
+			},
+		},
+	}
+
+	envNames := func() []string {
+		manifest, err := mf.ManifestFrom(mf.Recursive(testData))
+		assert.NilError(t, err)
+		manifest, err = manifest.Transform(updateApiEnv(spec))
+		assert.NilError(t, err)
+		deployment := &appsv1.Deployment{}
+		err = runtime.DefaultUnstructuredConverter.FromUnstructured(manifest.Resources()[0].Object, deployment)
+		assert.NilError(t, err)
+		for _, container := range deployment.Spec.Template.Spec.Containers {
+			if container.Name != apiContainerName {
+				continue
+			}
+			names := make([]string, 0, len(container.Env))
+			for _, env := range container.Env {
+				names = append(names, env.Name)
+			}
+			return names
+		}
+		t.Fatal("api container not found")
+		return nil
+	}
+
+	first := envNames()
+	for i := 0; i < 10; i++ {
+		got := envNames()
+		assert.DeepEqual(t, first, got)
+	}
+}
+
 func TestUpdateEnvWithDBSecretName(t *testing.T) {
 	testData := path.Join("testdata", "api-deployment.yaml")
 	manifest, err := mf.ManifestFrom(mf.Recursive(testData))
@@ -390,4 +443,368 @@ func Test_AddConfiguration(t *testing.T) {
 
 	// Verify PriorityClassName was applied
 	assert.Equal(t, deployment.Spec.Template.Spec.PriorityClassName, "system-cluster-critical")
+}
+
+func TestUpdateWatcherFlagsInDeployment(t *testing.T) {
+	gracePeriod := metav1.Duration{Duration: 24 * time.Hour}
+	checkOwner := false
+	disableIncomplete := true
+	storeDeadline := metav1.Duration{Duration: 10 * time.Minute}
+	summaryLabels := "tekton.dev/pipeline"
+	labelSelector := "app=foo,env=prod"
+
+	watcher := &v1alpha1.ResultsWatcherProperties{
+		CompletedRunGracePeriod:      &gracePeriod,
+		CheckOwner:                   &checkOwner,
+		DisableStoringIncompleteRuns: &disableIncomplete,
+		StoreDeadline:                &storeDeadline,
+		SummaryLabels:                &summaryLabels,
+		LabelSelector:                &labelSelector,
+	}
+
+	depInput := &appsv1.Deployment{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "Deployment",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: resultWatcherDeployment,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": "tekton-results-watcher"},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name: resultWatcherContainer,
+							Args: []string{
+								"-api_addr", "localhost:8080",
+								"-check_owner=true",
+								"-summary_labels", "old-value",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	jsonBytes, err := json.Marshal(depInput)
+	assert.NilError(t, err)
+	ud := &unstructured.Unstructured{}
+	err = json.Unmarshal(jsonBytes, ud)
+	assert.NilError(t, err)
+
+	transformer := updateWatcherFlagsInDeployment(watcher, resultWatcherDeployment, resultWatcherContainer)
+	err = transformer(ud)
+	assert.NilError(t, err)
+
+	outDep := &appsv1.Deployment{}
+	err = runtime.DefaultUnstructuredConverter.FromUnstructured(ud.Object, outDep)
+	assert.NilError(t, err)
+
+	args := outDep.Spec.Template.Spec.Containers[0].Args
+	assert.Equal(t, args[0], "-api_addr")
+	assert.Equal(t, args[1], "localhost:8080")
+	assert.Assert(t, containsArg(args, "-check_owner=false"))
+	assert.Assert(t, containsArg(args, "-completed_run_grace_period=24h0m0s"))
+	assert.Assert(t, containsArg(args, "-disable_storing_incomplete_runs=true"))
+	assert.Assert(t, containsArg(args, "-store_deadline=10m0s"))
+	assert.Assert(t, containsArg(args, "-summary_labels=tekton.dev/pipeline"))
+	assert.Assert(t, containsArg(args, "-label_selector=app=foo,env=prod"))
+	// Two-element form must not leave a stray value behind.
+	assert.Assert(t, !containsArg(args, "old-value"))
+	assert.Assert(t, !containsArg(args, "-summary_labels"))
+
+	// Free-text values must be hashed into labels (not written raw).
+	summaryLabelKey := resultWatcherDeployment + ".data.summary_labels"
+	selectorLabelKey := resultWatcherDeployment + ".data.label_selector"
+	assert.Assert(t, outDep.Spec.Template.Labels[summaryLabelKey] != "tekton.dev/pipeline")
+	assert.Assert(t, outDep.Spec.Template.Labels[selectorLabelKey] != "app=foo,env=prod")
+	assert.Equal(t, len(outDep.Spec.Template.Labels[summaryLabelKey]), 32)
+	assert.Equal(t, len(outDep.Spec.Template.Labels[selectorLabelKey]), 32)
+	assert.Equal(t, len(outDep.Spec.Template.Labels[resultWatcherDeployment+".data.check_owner"]), 32)
+
+	// Changing a value must change the hash (forces pod restart).
+	updatedSummary := "tekton.dev/task"
+	watcher.SummaryLabels = &updatedSummary
+	ud2 := &unstructured.Unstructured{}
+	err = json.Unmarshal(jsonBytes, ud2)
+	assert.NilError(t, err)
+	err = updateWatcherFlagsInDeployment(watcher, resultWatcherDeployment, resultWatcherContainer)(ud2)
+	assert.NilError(t, err)
+	outDep2 := &appsv1.Deployment{}
+	err = runtime.DefaultUnstructuredConverter.FromUnstructured(ud2.Object, outDep2)
+	assert.NilError(t, err)
+	assert.Assert(t, outDep.Spec.Template.Labels[summaryLabelKey] != outDep2.Spec.Template.Labels[summaryLabelKey])
+}
+
+func TestUpdateWatcherFlagsInDeployment_NegativeDurationTwoElementForm(t *testing.T) {
+	gracePeriod := metav1.Duration{Duration: 24 * time.Hour}
+	watcher := &v1alpha1.ResultsWatcherProperties{
+		CompletedRunGracePeriod: &gracePeriod,
+	}
+
+	depInput := &appsv1.Deployment{
+		TypeMeta:   metav1.TypeMeta{Kind: "Deployment"},
+		ObjectMeta: metav1.ObjectMeta{Name: resultWatcherDeployment},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "tekton-results-watcher"}},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name: resultWatcherContainer,
+						Args: []string{
+							"-completed_run_grace_period", "-1h",
+							"-api_addr", "localhost:8080",
+						},
+					}},
+				},
+			},
+		},
+	}
+
+	jsonBytes, err := json.Marshal(depInput)
+	assert.NilError(t, err)
+	ud := &unstructured.Unstructured{}
+	assert.NilError(t, json.Unmarshal(jsonBytes, ud))
+	assert.NilError(t, updateWatcherFlagsInDeployment(watcher, resultWatcherDeployment, resultWatcherContainer)(ud))
+
+	outDep := &appsv1.Deployment{}
+	assert.NilError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(ud.Object, outDep))
+	args := outDep.Spec.Template.Spec.Containers[0].Args
+	assert.Assert(t, containsArg(args, "-completed_run_grace_period=24h0m0s"))
+	assert.Assert(t, containsArg(args, "-api_addr"))
+	assert.Assert(t, containsArg(args, "localhost:8080"))
+	assert.Assert(t, !containsArg(args, "-1h"))
+	assert.Assert(t, !containsArg(args, "-completed_run_grace_period"))
+}
+
+func TestUpdateWatcherFlagsInDeployment_EmptySummaryLabelsClearsDefault(t *testing.T) {
+	empty := ""
+	watcher := &v1alpha1.ResultsWatcherProperties{
+		SummaryLabels: &empty,
+	}
+
+	depInput := &appsv1.Deployment{
+		TypeMeta:   metav1.TypeMeta{Kind: "Deployment"},
+		ObjectMeta: metav1.ObjectMeta{Name: resultWatcherDeployment},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "tekton-results-watcher"}},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name: resultWatcherContainer,
+						Args: []string{"-api_addr", "localhost:8080"},
+					}},
+				},
+			},
+		},
+	}
+
+	jsonBytes, err := json.Marshal(depInput)
+	assert.NilError(t, err)
+	ud := &unstructured.Unstructured{}
+	assert.NilError(t, json.Unmarshal(jsonBytes, ud))
+	assert.NilError(t, updateWatcherFlagsInDeployment(watcher, resultWatcherDeployment, resultWatcherContainer)(ud))
+
+	outDep := &appsv1.Deployment{}
+	assert.NilError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(ud.Object, outDep))
+	assert.Assert(t, containsArg(outDep.Spec.Template.Spec.Containers[0].Args, "-summary_labels="))
+}
+
+func TestUpdateWatcherFlagsInDeployment_NoOp(t *testing.T) {
+	depInput := &appsv1.Deployment{
+		TypeMeta: metav1.TypeMeta{Kind: "Deployment"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: resultWatcherDeployment,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": "tekton-results-watcher"},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: resultWatcherContainer, Args: []string{"-api_addr", "localhost:8080"}},
+					},
+				},
+			},
+		},
+	}
+	jsonBytes, err := json.Marshal(depInput)
+	assert.NilError(t, err)
+
+	t.Run("nil watcher", func(t *testing.T) {
+		ud := &unstructured.Unstructured{}
+		assert.NilError(t, json.Unmarshal(jsonBytes, ud))
+		assert.NilError(t, updateWatcherFlagsInDeployment(nil, resultWatcherDeployment, resultWatcherContainer)(ud))
+		outDep := &appsv1.Deployment{}
+		assert.NilError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(ud.Object, outDep))
+		assert.DeepEqual(t, outDep.Spec.Template.Spec.Containers[0].Args, []string{"-api_addr", "localhost:8080"})
+	})
+
+	t.Run("empty watcher", func(t *testing.T) {
+		ud := &unstructured.Unstructured{}
+		assert.NilError(t, json.Unmarshal(jsonBytes, ud))
+		assert.NilError(t, updateWatcherFlagsInDeployment(&v1alpha1.ResultsWatcherProperties{}, resultWatcherDeployment, resultWatcherContainer)(ud))
+		outDep := &appsv1.Deployment{}
+		assert.NilError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(ud.Object, outDep))
+		assert.DeepEqual(t, outDep.Spec.Template.Spec.Containers[0].Args, []string{"-api_addr", "localhost:8080"})
+	})
+
+	t.Run("wrong deployment name", func(t *testing.T) {
+		ud := &unstructured.Unstructured{}
+		assert.NilError(t, json.Unmarshal(jsonBytes, ud))
+		checkOwner := true
+		assert.NilError(t, updateWatcherFlagsInDeployment(&v1alpha1.ResultsWatcherProperties{CheckOwner: &checkOwner}, "other-deployment", resultWatcherContainer)(ud))
+		outDep := &appsv1.Deployment{}
+		assert.NilError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(ud.Object, outDep))
+		assert.DeepEqual(t, outDep.Spec.Template.Spec.Containers[0].Args, []string{"-api_addr", "localhost:8080"})
+	})
+
+	t.Run("wrong container name", func(t *testing.T) {
+		ud := &unstructured.Unstructured{}
+		assert.NilError(t, json.Unmarshal(jsonBytes, ud))
+		checkOwner := true
+		assert.NilError(t, updateWatcherFlagsInDeployment(&v1alpha1.ResultsWatcherProperties{CheckOwner: &checkOwner}, resultWatcherDeployment, "other-container")(ud))
+		outDep := &appsv1.Deployment{}
+		assert.NilError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(ud.Object, outDep))
+		assert.DeepEqual(t, outDep.Spec.Template.Spec.Containers[0].Args, []string{"-api_addr", "localhost:8080"})
+	})
+}
+
+func TestIsFlagValueToken(t *testing.T) {
+	tests := []struct {
+		name  string
+		token string
+		want  bool
+	}{
+		{name: "empty", token: "", want: true},
+		{name: "plain value", token: "localhost:8080", want: true},
+		{name: "negative duration", token: "-1h", want: true},
+		{name: "negative number", token: "-42", want: true},
+		{name: "single dash", token: "-", want: true},
+		{name: "flag name", token: "-api_addr", want: false},
+		{name: "long flag", token: "--foo", want: false},
+		{name: "uppercase flag", token: "-API", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, isFlagValueToken(tt.token), tt.want)
+		})
+	}
+}
+
+func TestHashLabelValue(t *testing.T) {
+	v1 := hashLabelValue("tekton.dev/pipeline")
+	v2 := hashLabelValue("tekton.dev/task")
+	assert.Equal(t, len(v1), 32)
+	assert.Equal(t, len(v2), 32)
+	assert.Equal(t, hashLabelValue("tekton.dev/pipeline"), v1)
+	assert.Assert(t, v1 != v2)
+}
+
+func containsArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestUpdateStatefulSetOrdinalsForResults(t *testing.T) {
+	fixtureReplicas := int32(3)
+	cr := &v1alpha1.TektonResult{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "result",
+			Namespace: "tekton-pipelines",
+		},
+		Spec: v1alpha1.TektonResultSpec{
+			CommonSpec: v1alpha1.CommonSpec{
+				TargetNamespace: "tekton-pipelines",
+			},
+			Result: v1alpha1.Result{
+				Performance: v1alpha1.PerformanceProperties{
+					PerformanceStatefulsetOrdinalsConfig: v1alpha1.PerformanceStatefulsetOrdinalsConfig{
+						StatefulsetOrdinals: ptr.Bool(true),
+					},
+				},
+			},
+		},
+	}
+
+	ctx := context.Background()
+	manifest, err := common.Fetch("../../common/testdata/test-convert-result-deployment-to-statefulset.yaml")
+	if err != nil {
+		t.Fatalf("Failed to fetch test data: %v", err)
+	}
+
+	r := &Reconciler{extension: common.NoExtension(ctx)}
+	err = r.transform(ctx, &manifest, cr)
+	if err != nil {
+		t.Fatalf("Error applying transformers: %v", err)
+	}
+
+	foundStatefulSet := false
+	for _, resource := range manifest.Resources() {
+		if resource.GetKind() == "StatefulSet" && resource.GetName() == tektonResultWatcherName {
+			foundStatefulSet = true
+
+			sts := &appsv1.StatefulSet{}
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(resource.Object, sts); err != nil {
+				t.Fatalf("Failed to convert resource to StatefulSet: %v", err)
+			}
+
+			if sts.Spec.Replicas == nil || *sts.Spec.Replicas != fixtureReplicas {
+				t.Errorf("Expected StatefulSet replicas to be %d, got %v", fixtureReplicas, sts.Spec.Replicas)
+			}
+
+			if sts.Spec.ServiceName != tektonResultWatcherServiceName {
+				t.Errorf("Expected StatefulSet serviceName to be %s, got %s", tektonResultWatcherServiceName, sts.Spec.ServiceName)
+			}
+
+			foundOrdinalEnv := false
+			foundServiceEnv := false
+			for _, container := range sts.Spec.Template.Spec.Containers {
+				for _, env := range container.Env {
+					if env.Name == tektonResultWatcherStatefulControllerOrdinal {
+						foundOrdinalEnv = true
+						if env.ValueFrom == nil || env.ValueFrom.FieldRef == nil || env.ValueFrom.FieldRef.FieldPath != "metadata.name" {
+							t.Errorf("Expected %s to use fieldRef metadata.name", tektonResultWatcherStatefulControllerOrdinal)
+						}
+					}
+					if env.Name == tektonResultWatcherStatefulServiceName {
+						foundServiceEnv = true
+						if env.Value != tektonResultWatcherServiceName {
+							t.Errorf("Expected %s value to be %s, got %s", tektonResultWatcherStatefulServiceName, tektonResultWatcherServiceName, env.Value)
+						}
+					}
+				}
+			}
+
+			if !foundOrdinalEnv {
+				t.Errorf("Expected to find environment variable %s", tektonResultWatcherStatefulControllerOrdinal)
+			}
+
+			if !foundServiceEnv {
+				t.Errorf("Expected to find environment variable %s", tektonResultWatcherStatefulServiceName)
+			}
+
+			break
+		}
+	}
+
+	if !foundStatefulSet {
+		t.Error("Expected to find a StatefulSet in the transformed manifest, but none was found")
+	}
+
+	for _, resource := range manifest.Resources() {
+		if resource.GetKind() == "Deployment" && resource.GetName() == tektonResultWatcherName {
+			t.Error("Expected Deployment to be removed from manifest")
+			break
+		}
+	}
 }

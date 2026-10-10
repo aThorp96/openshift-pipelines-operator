@@ -177,25 +177,26 @@ func TestInternetEgressRule(t *testing.T) {
 	}
 }
 
-func TestAPIServerEgressRule_Kubernetes(t *testing.T) {
-	params := networkpolicy.KubernetesPlatformDefaults()
-	rule := networkpolicy.APIServerEgressRule(params)
-	if len(rule.Ports) != 1 || rule.Ports[0].Port.IntVal != 443 {
-		t.Fatalf("expected port 443 for Kubernetes, got %v", rule.Ports)
+func TestSSHEgressRule(t *testing.T) {
+	rule := networkpolicy.SSHEgressRule()
+	if len(rule.Ports) != 1 {
+		t.Fatalf("expected 1 port, got %d", len(rule.Ports))
+	}
+	if rule.Ports[0].Port.IntVal != 22 {
+		t.Errorf("expected port 22, got %v", rule.Ports[0].Port.IntVal)
 	}
 	if len(rule.To) != 0 {
-		t.Errorf("expected no To restriction for API server egress, got %v", rule.To)
+		t.Errorf("expected no To restriction for SSH egress, got %v", rule.To)
 	}
 }
 
-func TestAPIServerEgressRule_OpenShift(t *testing.T) {
-	params := networkpolicy.OpenShiftPlatformDefaults()
-	rule := networkpolicy.APIServerEgressRule(params)
-	if len(rule.Ports) != 1 || rule.Ports[0].Port.IntVal != 6443 {
-		t.Fatalf("expected port 6443 for OpenShift, got %v", rule.Ports)
+func TestAPIServerEgressRule(t *testing.T) {
+	rule := networkpolicy.APIServerEgressRule()
+	if len(rule.Ports) != 0 {
+		t.Errorf("expected no port restriction (allow all), got %v", rule.Ports)
 	}
 	if len(rule.To) != 0 {
-		t.Errorf("expected no To restriction for API server egress, got %v", rule.To)
+		t.Errorf("expected no To restriction (allow all), got %v", rule.To)
 	}
 }
 
@@ -210,20 +211,37 @@ func TestDNSEgressRule_Kubernetes(t *testing.T) {
 			t.Errorf("expected DNS port 53 for Kubernetes, got %d", p.Port.IntVal)
 		}
 	}
-	if len(rule.To) != 1 || rule.To[0].NamespaceSelector == nil {
-		t.Fatalf("expected 1 To with NamespaceSelector, got %v", rule.To)
+	if len(rule.To) != 4 || rule.To[0].NamespaceSelector == nil {
+		t.Fatalf("expected 4 To peers (kube-dns selector + 3 ipBlocks), got %v", rule.To)
 	}
 	nsLabels := rule.To[0].NamespaceSelector.MatchLabels
 	if nsLabels["kubernetes.io/metadata.name"] != "kube-system" {
 		t.Errorf("expected kube-system namespace selector, got %v", nsLabels)
+	}
+	wantCIDRs := map[string]bool{"169.254.169.254/32": false, "169.254.169.253/32": false, "169.254.20.10/32": false}
+	for _, peer := range rule.To[1:] {
+		if peer.IPBlock == nil {
+			t.Errorf("expected ipBlock peer, got %v", peer)
+			continue
+		}
+		if _, ok := wantCIDRs[peer.IPBlock.CIDR]; !ok {
+			t.Errorf("unexpected ipBlock CIDR %s", peer.IPBlock.CIDR)
+			continue
+		}
+		wantCIDRs[peer.IPBlock.CIDR] = true
+	}
+	for cidr, seen := range wantCIDRs {
+		if !seen {
+			t.Errorf("missing ipBlock peer for %s", cidr)
+		}
 	}
 }
 
 func TestDNSEgressRule_OpenShift(t *testing.T) {
 	params := networkpolicy.OpenShiftPlatformDefaults()
 	rule := networkpolicy.DNSEgressRule(params)
-	if len(rule.To) == 0 || rule.To[0].NamespaceSelector == nil {
-		t.Fatalf("expected 1 To with NamespaceSelector, got %v", rule.To)
+	if len(rule.To) != 1 || rule.To[0].NamespaceSelector == nil {
+		t.Fatalf("expected exactly 1 To peer with NamespaceSelector (no ipBlocks on OpenShift), got %v", rule.To)
 	}
 	nsLabels := rule.To[0].NamespaceSelector.MatchLabels
 	if nsLabels["kubernetes.io/metadata.name"] != "openshift-dns" {
