@@ -40,7 +40,7 @@ spec:
 Behavior and precedence:
 
 - If `TEKTON_REGISTRY_OVERRIDE` is unset, images are taken from per-image env vars (if set) or from the shipped defaults.
-- If `TEKTON_REGISTRY_OVERRIDE` is set, the operator rewrites the registry host for all resolved images (from per-image env vars and defaults). The repository path and tag/digest are preserved.
+- If `TEKTON_REGISTRY_OVERRIDE` is set, the operator rewrites the registry host for all resolved images (from per-image env vars and defaults, including images with no matching per-image env var), for every component. The repository path and tag/digest are preserved.
 - There is currently no per-image opt-out when the global override is set. To exempt specific images, do not set `TEKTON_REGISTRY_OVERRIDE` and rely solely on per-image env vars.
 
 ## Rewrite image one by one
@@ -56,7 +56,9 @@ example.com/tektoncd/dashboard:v0.48.0
 
 ### Tekton instance update
 
-If you update an existing instance of tekton, you will need also to refresh the `TektonInstallerSets` so the new value can be taken into account.
+Changing `TEKTON_REGISTRY_OVERRIDE` on an existing installation is picked up automatically: the operator refreshes the affected `TektonInstallerSets` on its next reconcile, no manual action needed.
+
+If you instead change one of the per-image environment variables (`IMAGE_*`) without touching `TEKTON_REGISTRY_OVERRIDE`, you will need to refresh the `TektonInstallerSets` manually so the new value can be taken into account.
 
 ```bash
 kubectl delete tektoninstallerset <installer-set-name>
@@ -69,11 +71,7 @@ kubectl delete tektoninstallerset <installer-set-name>
 | Component              | Container/Args name                | Environment Variable                               |
 |------------------------|------------------------------------|----------------------------------------------------|
 | Chains                 | tekton-chains-controller           | `IMAGE_CHAINS_TEKTON_CHAINS_CONTROLLER`            |
-| Dashboard              | tekton-dashboard                   | `IMAGE_DASHBOARD_TEKTON_DASHBOARD`                 |
-| Hub                    | tekton-hub-api                     | `IMAGE_HUB_TEKTON_HUB_API`                         |
-| Hub                    | tekton-hub-db                      | `IMAGE_HUB_TEKTON_HUB_DB`                          |
-| Hub                    | tekton-hub-db-migration            | `IMAGE_HUB_TEKTON_HUB_DB_MIGRATION`                |
-| Hub                    | tekton-hub-ui                      | `IMAGE_HUB_TEKTON_HUB_UI`                          |
+| Dashboard              | tekton-dashboard                   | `IMAGE_DASHBOARD_TEKTON_DASHBOARD`                 |                        |
 | Manual Approval Gate   | manual-approval                    | `IMAGE_MAG_MANUAL_APPROVAL`                        |
 | Manual Approval Gate   | tekton-taskgroup-controller        | `IMAGE_MAG_TEKTON_TASKGROUP_CONTROLLER`            |
 | Pipeline               | arg:entrypoint-image               | `IMAGE_PIPELINES_ARG__ENTRYPOINT_IMAGE`            |
@@ -97,8 +95,8 @@ kubectl delete tektoninstallerset <installer-set-name>
 | Pruner CronJob         | image used in pruner cronJob       | `IMAGE_JOB_PRUNER_TKN`                             |
 | Tekton Pruner          | image used by pruner controller    | `IMAGE_PRUNER_CONTROLLER`                          |
 | Tekton Pruner          | image used by pruner webhook       | `IMAGE_PRUNER_WEBHOOK`                             |
-| Tekton Scheduler       | image used by scheduler controller | `IMAGE_SCHEDULER_MANAGER`                          |
-| Tekton Scheduler       | image used by scheduler webhook    | `IMAGE_SCHEDULER_WEBHOOK`                          |
+| Tekton Kueue           | controller                         | `IMAGE_KUEUE_MANAGER`                             |
+| Tekton Kueue           | webhook                            | `IMAGE_KUEUE_WEBHOOK`                             |
 | Multicluster Proxy AAE | proxy-aae                          | `IMAGE_MULTICLUSTERPROXYAAE_PROXY_AAE`          |
 | Syncer Service         | workload-controller                | `IMAGE_SYNCER_SERVICE_WORKLOAD_CONTROLLER`         |
 

@@ -19,6 +19,7 @@ package tektonconfig
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 
@@ -329,6 +330,15 @@ func TestConvertTLSVersionToNginx(t *testing.T) {
 
 func TestBuildNginxTLSDirectives(t *testing.T) {
 	ctx := context.TODO()
+	originalPath := fipsEnabledPath
+	originalLookup := lookupEnv
+	t.Cleanup(func() {
+		fipsEnabledPath = originalPath
+		lookupEnv = originalLookup
+	})
+	lookupEnv = func(string) (string, bool) { return "", false }
+	// Explicit non-FIPS so Intermediate ML-KEM groups are allowed in expectations.
+	writeFIPSProc(t, "0")
 
 	tests := []struct {
 		name                string
@@ -341,82 +351,94 @@ func TestBuildNginxTLSDirectives(t *testing.T) {
 			tlsConfig: &occommon.TLSEnvVars{
 				MinVersion:       "1.3",
 				CipherSuites:     "TLS_AES_128_GCM_SHA256,TLS_AES_256_GCM_SHA384",
-				CurvePreferences: "X25519,prime256v1",
+				CurvePreferences: "X25519MLKEM768,X25519,secp256r1,secp384r1,secp521r1",
 			},
 			expectedContains: []string{
 				"ssl_protocols TLSv1.3;",
-				"ssl_conf_command Groups X25519MLKEM768:X25519;",
 				"ssl_conf_command Ciphersuites TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384;",
-				"ssl_ecdh_curve X25519:prime256v1;",
+				// API TLSGroup names (secp*) are mapped to OpenSSL (P-*) for nginx.
+				"ssl_ecdh_curve X25519MLKEM768:X25519:P-256:P-384:P-521;",
 			},
 			expectedNotContains: []string{
 				"ssl_ciphers",
 				"ssl_prefer_server_ciphers",
+				"ssl_conf_command Groups",
 			},
 		},
 		{
-			name: "only min version provided - ML-KEM enabled",
+			name: "only min version provided",
 			tlsConfig: &occommon.TLSEnvVars{
 				MinVersion: "1.2",
 			},
 			expectedContains: []string{
 				"ssl_protocols TLSv1.2 TLSv1.3;",
-				"ssl_conf_command Groups X25519MLKEM768:X25519;",
-				"ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256;",
+				"ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256;",
+				"ssl_ecdh_curve X25519MLKEM768:X25519:P-256:P-384:P-521;",
 			},
 			expectedNotContains: []string{
 				"ssl_ciphers",
-				"ssl_ecdh_curve",
+				"ssl_conf_command Groups",
 			},
 		},
 		{
-			name: "TLS 1.3 only - ML-KEM enabled",
+			name: "TLS 1.3 only",
 			tlsConfig: &occommon.TLSEnvVars{
 				MinVersion: "1.3",
 			},
 			expectedContains: []string{
 				"ssl_protocols TLSv1.3;",
-				"ssl_conf_command Groups X25519MLKEM768:X25519;",
-				"ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256;",
+				"ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256;",
+				"ssl_ecdh_curve X25519MLKEM768:X25519:P-256:P-384:P-521;",
 			},
 			expectedNotContains: []string{
 				"ssl_ciphers",
-				"ssl_ecdh_curve",
+				"ssl_conf_command Groups",
 			},
 		},
 		{
-			name: "only cipher suites provided — default ssl_protocols and ML-KEM still emitted",
+			name: "only cipher suites provided — default ssl_protocols still emitted",
 			tlsConfig: &occommon.TLSEnvVars{
 				CipherSuites: "TLS_AES_128_GCM_SHA256",
 			},
 			expectedContains: []string{
 				"ssl_protocols TLSv1.2 TLSv1.3;",
-				"ssl_conf_command Groups X25519MLKEM768:X25519;",
 				"ssl_conf_command Ciphersuites TLS_AES_128_GCM_SHA256;",
+				"ssl_ecdh_curve X25519MLKEM768:X25519:P-256:P-384:P-521;",
 			},
 			expectedNotContains: []string{
 				"ssl_ciphers",
 				"ssl_prefer_server_ciphers",
+				"ssl_conf_command Groups",
 			},
 		},
 		{
-			name: "only curve preferences provided",
-			tlsConfig: &occommon.TLSEnvVars{
-				CurvePreferences: "X25519",
-			},
-			expectedContains: []string{
-				"ssl_ecdh_curve X25519;",
-			},
-		},
-		{
-			// With nil tlsConfig (cluster "Default" profile), secure defaults apply:
-			// ssl_protocols TLSv1.2 TLSv1.3 (Intermediate-equivalent) + ML-KEM.
-			name:      "nil TLS config uses Intermediate defaults and always enables ML-KEM",
+			// With nil tlsConfig (cluster "Default" profile), secure Intermediate
+			// defaults are applied so nginx never falls back to its broad built-in
+			// cipher and protocol set.
+			name:      "nil TLS config uses Intermediate defaults",
 			tlsConfig: nil,
 			expectedContains: []string{
 				"ssl_protocols TLSv1.2 TLSv1.3;",
-				"ssl_conf_command Groups X25519MLKEM768:X25519;",
-				"ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256;",
+				"ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256;",
+				"ssl_ecdh_curve X25519MLKEM768:X25519:P-256:P-384:P-521;",
+			},
+			expectedNotContains: []string{
+				"ssl_conf_command Groups",
+			},
+		},
+		{
+			name: "custom curve preferences from APIServer profile",
+			tlsConfig: &occommon.TLSEnvVars{
+				MinVersion:       "1.2",
+				CurvePreferences: "X25519,secp256r1",
+			},
+			expectedContains: []string{
+				"ssl_protocols TLSv1.2 TLSv1.3;",
+				"ssl_ecdh_curve X25519:P-256;",
+			},
+			expectedNotContains: []string{
+				"X25519MLKEM768",
+				"ssl_conf_command Groups",
 			},
 		},
 	}
@@ -440,8 +462,191 @@ func TestBuildNginxTLSDirectives(t *testing.T) {
 	}
 }
 
+func TestIsFIPSEnabled(t *testing.T) {
+	originalPath := fipsEnabledPath
+	originalLookup := lookupEnv
+	t.Cleanup(func() {
+		fipsEnabledPath = originalPath
+		lookupEnv = originalLookup
+	})
+
+	t.Run("returns true when file does not exist (fail closed)", func(t *testing.T) {
+		lookupEnv = func(string) (string, bool) { return "", false }
+		fipsEnabledPath = "/nonexistent/path/fips_enabled"
+		require.True(t, isFIPSEnabled())
+	})
+
+	t.Run("returns false when file contains 0", func(t *testing.T) {
+		lookupEnv = func(string) (string, bool) { return "", false }
+		writeFIPSProc(t, "0")
+		require.False(t, isFIPSEnabled())
+	})
+
+	t.Run("returns true when file contains 1", func(t *testing.T) {
+		lookupEnv = func(string) (string, bool) { return "", false }
+		writeFIPSProc(t, "1")
+		require.True(t, isFIPSEnabled())
+	})
+
+	t.Run("FIPS_ENABLED env overrides procfs", func(t *testing.T) {
+		writeFIPSProc(t, "0")
+		lookupEnv = func(k string) (string, bool) {
+			if k == "FIPS_ENABLED" {
+				return "true", true
+			}
+			return "", false
+		}
+		require.True(t, isFIPSEnabled())
+	})
+
+	t.Run("FIPS_ENABLED=false forces non-FIPS", func(t *testing.T) {
+		writeFIPSProc(t, "1")
+		lookupEnv = func(k string) (string, bool) {
+			if k == "FIPS_ENABLED" {
+				return "false", true
+			}
+			return "", false
+		}
+		require.False(t, isFIPSEnabled())
+	})
+}
+
+func writeFIPSProc(t *testing.T, value string) {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "fips_enabled")
+	require.NoError(t, err)
+	_, err = f.WriteString(value + "\n")
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	fipsEnabledPath = f.Name()
+}
+
+func TestTLSECDHGroups(t *testing.T) {
+	originalPath := fipsEnabledPath
+	originalLookup := lookupEnv
+	t.Cleanup(func() {
+		fipsEnabledPath = originalPath
+		lookupEnv = originalLookup
+	})
+	lookupEnv = func(string) (string, bool) { return "", false }
+
+	t.Run("non-FIPS: includes X25519MLKEM768 for PQC", func(t *testing.T) {
+		writeFIPSProc(t, "0")
+		groups := tlsECDHGroups()
+		require.Equal(t, "X25519MLKEM768:X25519:P-256:P-384:P-521", groups)
+	})
+
+	t.Run("FIPS: only NIST curves, no X25519 or MLKEM", func(t *testing.T) {
+		writeFIPSProc(t, "1")
+		groups := tlsECDHGroups()
+		require.Equal(t, "P-256:P-384:P-521", groups)
+		require.NotContains(t, groups, "MLKEM")
+		require.NotContains(t, groups, "X25519")
+	})
+
+	t.Run("unknown FIPS status: fail closed to NIST-only", func(t *testing.T) {
+		fipsEnabledPath = "/nonexistent/path/fips_enabled"
+		groups := tlsECDHGroups()
+		require.Equal(t, "P-256:P-384:P-521", groups)
+		require.NotContains(t, groups, "X25519")
+	})
+}
+
+func TestNginxECDHCurve(t *testing.T) {
+	originalPath := fipsEnabledPath
+	originalLookup := lookupEnv
+	t.Cleanup(func() {
+		fipsEnabledPath = originalPath
+		lookupEnv = originalLookup
+	})
+	lookupEnv = func(string) (string, bool) { return "", false }
+
+	t.Run("uses API curve preferences when present", func(t *testing.T) {
+		writeFIPSProc(t, "0")
+		got := nginxECDHCurve(&occommon.TLSEnvVars{
+			CurvePreferences: "X25519MLKEM768,X25519,secp256r1,secp384r1",
+		})
+		require.Equal(t, "X25519MLKEM768:X25519:P-256:P-384", got)
+	})
+
+	t.Run("falls back to Intermediate defaults when CurvePreferences empty", func(t *testing.T) {
+		writeFIPSProc(t, "0")
+		got := nginxECDHCurve(&occommon.TLSEnvVars{MinVersion: "1.2"})
+		require.Equal(t, "X25519MLKEM768:X25519:P-256:P-384:P-521", got)
+	})
+
+	t.Run("FIPS strips X25519 groups from API preferences", func(t *testing.T) {
+		writeFIPSProc(t, "1")
+		got := nginxECDHCurve(&occommon.TLSEnvVars{
+			CurvePreferences: "X25519MLKEM768,X25519,secp256r1,secp384r1,secp521r1",
+		})
+		require.Equal(t, "P-256:P-384:P-521", got)
+	})
+
+	// Regression for the CrashLoopBackOff seen when ssl_conf_command Groups
+	// (and equivalently ssl_ecdh_curve) advertised X25519MLKEM768 on FIPS:
+	//   nginx: [emerg] SSL_CONF_cmd("Groups","X25519MLKEM768:X25519") failed
+	t.Run("regression: FIPS never emits the Groups values that crashed nginx", func(t *testing.T) {
+		writeFIPSProc(t, "1")
+		got := nginxECDHCurve(&occommon.TLSEnvVars{
+			// Exact payload shape that previously CrashLoopBackOff'd nginx.
+			CurvePreferences: "X25519MLKEM768,X25519",
+		})
+		require.Equal(t, "P-256:P-384:P-521", got,
+			"must fall back to NIST defaults when API prefs are all FIPS-rejected")
+		require.NotContains(t, got, "X25519MLKEM768")
+		require.NotContains(t, got, "X25519")
+	})
+
+	t.Run("regression: unknown FIPS status never emits X25519MLKEM768", func(t *testing.T) {
+		fipsEnabledPath = "/nonexistent/path/fips_enabled"
+		got := nginxECDHCurve(&occommon.TLSEnvVars{
+			CurvePreferences: "X25519MLKEM768,X25519,secp256r1",
+		})
+		require.Equal(t, "P-256", got)
+		require.NotContains(t, got, "X25519")
+	})
+}
+
+func TestAPITLSGroupsToNginxECDHCurve(t *testing.T) {
+	require.Equal(t, "X25519:P-256:P-384", apiTLSGroupsToNginxECDHCurve("X25519,secp256r1,secp384r1"))
+	require.Equal(t, "", apiTLSGroupsToNginxECDHCurve(""))
+}
+
+func TestBuildNginxTLSDirectives_NeverUsesSSLConfGroups(t *testing.T) {
+	// The original CrashLoop used `ssl_conf_command Groups …`. We must only
+	// advertise curves via ssl_ecdh_curve (still mapped to SSL_CONF Groups by
+	// nginx/OpenSSL, but gated by the FIPS allowlist above).
+	originalPath := fipsEnabledPath
+	originalLookup := lookupEnv
+	t.Cleanup(func() {
+		fipsEnabledPath = originalPath
+		lookupEnv = originalLookup
+	})
+	lookupEnv = func(string) (string, bool) { return "", false }
+	writeFIPSProc(t, "0")
+
+	cpr := &consolePluginReconciler{
+		tlsConfig: &occommon.TLSEnvVars{
+			MinVersion:       "1.2",
+			CurvePreferences: "X25519MLKEM768,X25519,secp256r1",
+		},
+	}
+	out := cpr.buildNginxTLSDirectives()
+	require.Contains(t, out, "ssl_ecdh_curve X25519MLKEM768:X25519:P-256;")
+	require.NotContains(t, out, "ssl_conf_command Groups")
+}
+
 func TestGenerateNginxConfWithTLS(t *testing.T) {
 	ctx := context.TODO()
+	originalPath := fipsEnabledPath
+	originalLookup := lookupEnv
+	t.Cleanup(func() {
+		fipsEnabledPath = originalPath
+		lookupEnv = originalLookup
+	})
+	lookupEnv = func(string) (string, bool) { return "", false }
+	writeFIPSProc(t, "0")
 
 	baseNginxConf := `error_log /dev/stdout warn;
 events {}
@@ -466,38 +671,40 @@ http {
 		expectedNotContains []string
 	}{
 		{
-			name: "with TLS configuration (ML-KEM enabled)",
+			name: "with TLS configuration",
 			tlsConfig: &occommon.TLSEnvVars{
-				MinVersion:       "1.2",
-				CipherSuites:     "TLS_AES_128_GCM_SHA256",
-				CurvePreferences: "X25519",
+				MinVersion:   "1.2",
+				CipherSuites: "TLS_AES_128_GCM_SHA256",
 			},
 			expectedContains: []string{
 				"server {",
 				"ssl_protocols TLSv1.2 TLSv1.3;",
-				"ssl_conf_command Groups X25519MLKEM768:X25519;",
 				"ssl_conf_command Ciphersuites TLS_AES_128_GCM_SHA256;",
-				"ssl_ecdh_curve X25519;",
+				"ssl_ecdh_curve X25519MLKEM768:X25519:P-256:P-384:P-521;",
 				"listen              8443 ssl;",
 				"ssl_certificate     /var/cert/tls.crt;",
 			},
 			expectedNotContains: []string{
 				"ssl_ciphers",
 				"ssl_prefer_server_ciphers",
+				"ssl_conf_command Groups",
 			},
 		},
 		{
-			// With nil tlsConfig (cluster "Default" profile), defaults are injected so
-			// ML-KEM is always enabled even without an explicit TLS profile.
-			name:      "nil TLS config injects Intermediate defaults and ML-KEM into nginx.conf",
+			// With nil tlsConfig (cluster "Default" profile), Intermediate defaults
+			// are injected so nginx never falls back to its broad built-in cipher set.
+			name:      "nil TLS config injects Intermediate defaults into nginx.conf",
 			tlsConfig: nil,
 			expectedContains: []string{
 				"server {",
 				"ssl_protocols TLSv1.2 TLSv1.3;",
-				"ssl_conf_command Groups X25519MLKEM768:X25519;",
-				"ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256;",
+				"ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256;",
+				"ssl_ecdh_curve X25519MLKEM768:X25519:P-256:P-384:P-521;",
 				"listen              8443 ssl;",
 				"ssl_certificate     /var/cert/tls.crt;",
+			},
+			expectedNotContains: []string{
+				"ssl_conf_command Groups",
 			},
 		},
 	}
@@ -653,6 +860,15 @@ func TestTransformerNginxTLS(t *testing.T) {
 
 func TestNginxTLSIntegration(t *testing.T) {
 	ctx := context.TODO()
+	originalPath := fipsEnabledPath
+	originalLookup := lookupEnv
+	t.Cleanup(func() {
+		fipsEnabledPath = originalPath
+		lookupEnv = originalLookup
+	})
+	lookupEnv = func(string) (string, bool) { return "", false }
+	writeFIPSProc(t, "0")
+
 	operatorFakeClientSet := fake.NewSimpleClientset()
 	operatorFakeClientSet.PrependReactor("create", "*", generateNameReactor)
 
@@ -665,25 +881,27 @@ func TestNginxTLSIntegration(t *testing.T) {
 		{
 			name: "integration test with full TLS config",
 			tlsConfig: &occommon.TLSEnvVars{
-				MinVersion:       "1.2",
-				CipherSuites:     "TLS_AES_128_GCM_SHA256,TLS_AES_256_GCM_SHA384",
-				CurvePreferences: "X25519,prime256v1",
+				MinVersion:   "1.2",
+				CipherSuites: "TLS_AES_128_GCM_SHA256,TLS_AES_256_GCM_SHA384",
 			},
 			expectedTLSInNginx: []string{
 				"ssl_protocols TLSv1.2 TLSv1.3;",
 				"ssl_conf_command Ciphersuites TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384;",
-				"ssl_ecdh_curve X25519:prime256v1;",
+				"ssl_ecdh_curve X25519MLKEM768:X25519:P-256:P-384:P-521;",
 			},
 		},
 		{
-			// nil tlsConfig (cluster "Default" profile) — Intermediate defaults and
-			// ML-KEM are always injected so PQC is available on fresh installs.
-			name:      "integration test with nil TLS config injects Intermediate defaults and ML-KEM",
+			// nil tlsConfig (cluster "Default" profile) — Intermediate defaults are
+			// applied so nginx never falls back to its broad built-in cipher set.
+			name:      "integration test with nil TLS config injects Intermediate defaults",
 			tlsConfig: nil,
 			expectedTLSInNginx: []string{
 				"ssl_protocols TLSv1.2 TLSv1.3;",
-				"ssl_conf_command Groups X25519MLKEM768:X25519;",
-				"ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256;",
+				"ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256;",
+				"ssl_ecdh_curve X25519MLKEM768:X25519:P-256:P-384:P-521;",
+			},
+			notExpected: []string{
+				"ssl_conf_command Groups",
 			},
 		},
 	}

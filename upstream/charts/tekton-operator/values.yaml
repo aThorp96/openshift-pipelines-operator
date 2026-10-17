@@ -12,15 +12,29 @@ kubernetesMinVersion: "v1.34.0"
 ## Choose between the vanilla Kubernetes flavor and the Openshift flavor of this Helm chart
 ## Container images, RBAC resources and operator settings will be adjusted automatically,
 ## unless explicitly overridden by a Helm value.
+##
+## Note for the Openshift flavor: the chart does not set the IMAGE_ADDONS_* env vars.
+## TektonAddon image defaults come from the operator's built-in manifests; to use a
+## custom registry (e.g. a mirror of registry.redhat.io), set TEKTON_REGISTRY_OVERRIDE
+## or the per-image IMAGE_ADDONS_* env vars via operator.additionalEnvs — see
+## https://github.com/tektoncd/operator/blob/main/docs/AirGapImageConfiguration.md
 openshift:
   enabled: false
 
 ## If the Tekton-operator CRDs should automatically be installed and upgraded
 ## Setting this to true will cause a cascade deletion of all Tekton resources when you uninstall the chart - danger!
+## Note: on a cluster without the Tekton CRDs already present, the webhook pod
+## CrashLoops until they are served — keep this true (or pre-apply the CRDs) on fresh clusters.
 installCRDs: false
 
-## Controllers to install
-controllers: "tektonconfig,tektonpipeline,tektontrigger,tektonhub,tektonchain,tektonresult,tektondashboard,manualapprovalgate,tektonpruner,openshiftpipelinesascode"
+## Controllers to install (comma-separated list passed to the operator's
+## -controllers flag). Leave empty for the flavor default:
+##   common:     tektonconfig,tektonpipeline,tektontrigger,tektonchain,tektonresult,
+##               manualapprovalgate,tektonpruner,tektonscheduler,tektonmulticlusterproxyaae,
+##               openshiftpipelinesascode
+##   kubernetes: common + tektondashboard
+##   openshift:  common + tektonaddon,syncerservice
+controllers: ""
 
 ## Control the creation of RBAC resources (Serviceaccount, Role, ClusterRole, ClusterRoleBinding)
 rbac:
@@ -34,6 +48,10 @@ rbac:
 
 ## Configuration for the tekton-operator pod
 operator:
+  # Number of replicas for the operator Deployment. Knative leader election is
+  # active by default, so >=2 runs active/standby (no duplicate writes). A
+  # config-leader-election ConfigMap is optional; defaults apply if absent.
+  replicas: 1
   # Internal name of the operator. Default value depends on the flavor (k8s/openshift).
   operatorName: ""
   image:
@@ -47,6 +65,11 @@ operator:
   autoInstallComponents: true
   # The namespace in which Tekton components should be deployed
   # Defaults to "tekton-pipelines" for Kubernetes and to "openshift-pipelines" for Openshift flavor.
+  # First-install-only: it seeds the auto-created TektonConfig CR; once the CR exists,
+  # the operator never re-reads this value. To change it later, set spec.targetNamespace
+  # on the TektonConfig CR (requires deleting and recreating the CR).
+  # On the Openshift flavor it must be "openshift-pipelines": the addon sample pipelines
+  # hardcode that namespace, so the chart fails to render with any other value.
   defaultTargetNamespace: ""
   # Log level of the operator
   logLevel: info
@@ -74,6 +97,10 @@ pruner:
 
 ## Configuration for the tekton-operator-webhook pod
 webhook:
+  # Number of replicas for the webhook Deployment. Floored at 1: a webhook
+  # with 0 pods times out admission calls under failurePolicy: Fail and can
+  # wedge operations on the matched CRs.
+  replicas: 1
   hostNetwork: false
   dnsPolicy: ""
   httpsWebhookPort: 8443
@@ -131,3 +158,16 @@ securityContext: {}
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+## Extra Kubernetes manifests to deploy alongside the operator (rendered as-is).
+## Useful for resources the chart intentionally does not template, e.g. a TektonConfig CR.
+## Note: if you supply a TektonConfig here, set operator.autoInstallComponents to false
+## to avoid racing the operator's own auto-install, which creates TektonConfig/config.
+extraObjects: []
+# extraObjects:
+#   - apiVersion: operator.tekton.dev/v1alpha1
+#     kind: TektonConfig
+#     metadata:
+#       name: config
+#     spec:
+#       profile: all

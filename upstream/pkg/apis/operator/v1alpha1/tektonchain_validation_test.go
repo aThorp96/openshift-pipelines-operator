@@ -22,6 +22,7 @@ import (
 
 	"gotest.tools/v3/assert"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"knative.dev/pkg/apis"
 )
@@ -76,6 +77,28 @@ func Test_ValidateTektonChain_ConfigTaskRunFormat(t *testing.T) {
 	td.Spec.Chain.ChainProperties.ArtifactsTaskRunFormat = "test"
 	err := td.Validate(context.TODO())
 	assert.Equal(t, "invalid value: test: spec.artifacts.taskrun.format", err.Error())
+}
+
+func Test_ValidateTektonChain_ConfigTaskRunFormatValid(t *testing.T) {
+	td := &TektonChain{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "chain",
+			Namespace: "namespace",
+		},
+		Spec: TektonChainSpec{
+			CommonSpec: CommonSpec{
+				TargetNamespace: "namespace",
+			},
+		},
+	}
+
+	for _, format := range allowedArtifactsTaskRunFormat.List() {
+		td.Spec.Chain.ChainProperties.ArtifactsTaskRunFormat = format
+		err := td.Validate(context.TODO())
+		if err != nil {
+			t.Errorf("ValidateTektonChain.Validate() expected no error for taskrun format %q, but got: %v", format, err)
+		}
+	}
 }
 
 func Test_ValidateTektonChain_ConfigTaskRunStorage(t *testing.T) {
@@ -153,6 +176,28 @@ func Test_ValidateTektonChain_ConfigPipelineRunFormat(t *testing.T) {
 	td.Spec.Chain.ChainProperties.ArtifactsPipelineRunFormat = "test"
 	err := td.Validate(context.TODO())
 	assert.Equal(t, "invalid value: test: spec.artifacts.pipelinerun.format", err.Error())
+}
+
+func Test_ValidateTektonChain_ConfigPipelineRunFormatValid(t *testing.T) {
+	td := &TektonChain{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "chain",
+			Namespace: "namespace",
+		},
+		Spec: TektonChainSpec{
+			CommonSpec: CommonSpec{
+				TargetNamespace: "namespace",
+			},
+		},
+	}
+
+	for _, format := range allowedArtifactsPipelineRunFormat.List() {
+		td.Spec.Chain.ChainProperties.ArtifactsPipelineRunFormat = format
+		err := td.Validate(context.TODO())
+		if err != nil {
+			t.Errorf("ValidateTektonChain.Validate() expected no error for pipelinerun format %q, but got: %v", format, err)
+		}
+	}
 }
 
 func Test_ValidateTektonChain_ConfigPipelineRunStorage(t *testing.T) {
@@ -365,6 +410,44 @@ func Test_ValidateTektonChain_ConfigBuildDefinitionType(t *testing.T) {
 	}
 }
 
+func Test_ValidateTektonChain_InvalidStorageOCIEncodingFormat(t *testing.T) {
+	tc := &TektonChain{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "chain",
+			Namespace: "namespace",
+		},
+		Spec: TektonChainSpec{
+			CommonSpec: CommonSpec{
+				TargetNamespace: "namespace",
+			},
+		},
+	}
+	tc.Spec.Chain.ChainProperties.StorageOCIEncodingFormat = "unknown-format"
+	err := tc.Validate(context.TODO())
+	assert.Equal(t, "invalid value: unknown-format: spec.storage.oci.encoding-format", err.Error())
+}
+
+func Test_ValidateTektonChain_ValidStorageOCIEncodingFormat(t *testing.T) {
+	tc := &TektonChain{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "chain",
+			Namespace: "namespace",
+		},
+		Spec: TektonChainSpec{
+			CommonSpec: CommonSpec{
+				TargetNamespace: "namespace",
+			},
+		},
+	}
+	for _, format := range []string{"dsse", "sigstore-bundle"} {
+		tc.Spec.Chain.ChainProperties.StorageOCIEncodingFormat = format
+		err := tc.Validate(context.TODO())
+		if err != nil {
+			t.Errorf("ValidateTektonChain.Validate() expected no error for encoding-format %q, but got: %v", format, err)
+		}
+	}
+}
+
 func Test_ValidateTektonChain_InvalidControllerEnv(t *testing.T) {
 	tc := &TektonChain{
 		ObjectMeta: metav1.ObjectMeta{
@@ -411,5 +494,90 @@ func Test_ValidateTektonChain_ValidControllerEnv(t *testing.T) {
 	err := tc.Validate(context.TODO())
 	if err != nil {
 		t.Errorf("ValidateTektonChain: %v", err)
+	}
+}
+
+func Test_ValidateTektonChain_NetworkPolicyEmpty(t *testing.T) {
+	tc := &TektonChain{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "chain",
+			Namespace: "namespace",
+		},
+		Spec: TektonChainSpec{
+			CommonSpec: CommonSpec{
+				TargetNamespace: "namespace",
+			},
+		},
+	}
+	err := tc.Validate(context.TODO())
+	if err != nil {
+		t.Errorf("expected no error for empty NetworkPolicy, got: %v", err)
+	}
+}
+
+func Test_ValidateTektonChain_NetworkPolicyDisabled(t *testing.T) {
+	tc := &TektonChain{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "chain",
+			Namespace: "namespace",
+		},
+		Spec: TektonChainSpec{
+			CommonSpec: CommonSpec{
+				TargetNamespace: "namespace",
+			},
+			NetworkPolicy: NetworkPolicyConfig{
+				Disabled: true,
+			},
+		},
+	}
+	err := tc.Validate(context.TODO())
+	if err != nil {
+		t.Errorf("expected no error for disabled NetworkPolicy, got: %v", err)
+	}
+}
+
+func Test_ValidateTektonChain_NetworkPolicyValidPolicyName(t *testing.T) {
+	tc := &TektonChain{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "chain",
+			Namespace: "namespace",
+		},
+		Spec: TektonChainSpec{
+			CommonSpec: CommonSpec{
+				TargetNamespace: "namespace",
+			},
+			NetworkPolicy: NetworkPolicyConfig{
+				Policies: map[string]networkingv1.NetworkPolicySpec{
+					"my-custom-policy": {},
+				},
+			},
+		},
+	}
+	err := tc.Validate(context.TODO())
+	if err != nil {
+		t.Errorf("expected no error for valid policy name, got: %v", err)
+	}
+}
+
+func Test_ValidateTektonChain_NetworkPolicyInvalidPolicyName(t *testing.T) {
+	tc := &TektonChain{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "chain",
+			Namespace: "namespace",
+		},
+		Spec: TektonChainSpec{
+			CommonSpec: CommonSpec{
+				TargetNamespace: "namespace",
+			},
+			NetworkPolicy: NetworkPolicyConfig{
+				Policies: map[string]networkingv1.NetworkPolicySpec{
+					"INVALID_NAME!": {},
+				},
+			},
+		},
+	}
+	err := tc.Validate(context.TODO())
+	if err == nil {
+		t.Error("expected error for invalid policy name, got nil")
 	}
 }
