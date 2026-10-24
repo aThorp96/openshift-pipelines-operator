@@ -43,6 +43,11 @@ func (tp *TektonResult) Validate(ctx context.Context) (errs *apis.FieldError) {
 }
 
 func (trs *TektonResultSpec) validate(path string) (errs *apis.FieldError) {
+	// validate the embedded CommonSpec (e.g. targetNamespace denylist),
+	// which TektonResult would otherwise bypass since it does not call
+	// CommonSpec.validate the way the other components do.
+	errs = errs.Also(trs.CommonSpec.validate(path))
+
 	if trs.LokiStackName != "" {
 		if strings.ToLower(trs.LogsType) != LogsTypeLoki && trs.LogsType != "" {
 			errMsg := fmt.Sprintf("Loki stack is only supported when logs_type is loki or empty, got logs_type: %s", trs.LogsType)
@@ -54,8 +59,32 @@ func (trs *TektonResultSpec) validate(path string) (errs *apis.FieldError) {
 		}
 	}
 
+	// validate route TLS termination
+	errs = errs.Also(trs.ResultsAPIProperties.validateRouteTLSTermination(path))
+
 	// validate performance properties
 	errs = errs.Also(trs.Performance.Validate(fmt.Sprintf("%s.performance", path)))
 
+	// validate watcher properties
+	errs = errs.Also(trs.Watcher.Validate(fmt.Sprintf("%s.watcher", path)))
+
+	errs = errs.Also(trs.NetworkPolicy.validate(fmt.Sprintf("%s.networkPolicy", path)))
+
 	return errs
+}
+
+// validateRouteTLSTermination validates that the route TLS termination type is one of the
+// supported values. It is called from both TektonResult and TektonConfig validators so that
+// unsupported values are rejected at the parent (TektonConfig) level as well.
+func (props ResultsAPIProperties) validateRouteTLSTermination(path string) *apis.FieldError {
+	if props.RouteTLSTermination == "" {
+		return nil
+	}
+	switch props.RouteTLSTermination {
+	case "edge", "reencrypt", "passthrough":
+		return nil
+	default:
+		errMsg := fmt.Sprintf("unsupported route TLS termination type %q, must be one of: edge, reencrypt, passthrough", props.RouteTLSTermination)
+		return apis.ErrInvalidValue(props.RouteTLSTermination, fmt.Sprintf("%s.route_tls_termination", path), errMsg)
+	}
 }
