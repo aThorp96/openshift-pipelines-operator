@@ -43,6 +43,11 @@ func (tp *TektonResult) Validate(ctx context.Context) (errs *apis.FieldError) {
 }
 
 func (trs *TektonResultSpec) validate(path string) (errs *apis.FieldError) {
+	// validate the embedded CommonSpec (e.g. targetNamespace denylist),
+	// which TektonResult would otherwise bypass since it does not call
+	// CommonSpec.validate the way the other components do.
+	errs = errs.Also(trs.CommonSpec.validate(path))
+
 	if trs.LokiStackName != "" {
 		if strings.ToLower(trs.LogsType) != LogsTypeLoki && trs.LogsType != "" {
 			errMsg := fmt.Sprintf("Loki stack is only supported when logs_type is loki or empty, got logs_type: %s", trs.LogsType)
@@ -54,8 +59,75 @@ func (trs *TektonResultSpec) validate(path string) (errs *apis.FieldError) {
 		}
 	}
 
+	// validate Results API settings, including route TLS termination
+	errs = errs.Also(trs.ResultsAPIProperties.validate(path))
+
 	// validate performance properties
 	errs = errs.Also(trs.Performance.Validate(fmt.Sprintf("%s.performance", path)))
 
+	// validate watcher properties
+	errs = errs.Also(trs.Watcher.Validate(fmt.Sprintf("%s.watcher", path)))
+
+	errs = errs.Also(trs.NetworkPolicy.validate(fmt.Sprintf("%s.networkPolicy", path)))
+
 	return errs
+}
+
+// validate checks Results API fields that have a fixed set of values or a
+// numeric range.
+func (props ResultsAPIProperties) validate(path string) (errs *apis.FieldError) {
+	errs = errs.Also(props.validateRouteTLSTermination(path))
+
+	if props.SQLLogLevel != "" {
+		switch props.SQLLogLevel {
+		case "silent", "error", "warn", "info":
+		default:
+			errs = errs.Also(apis.ErrInvalidValue(props.SQLLogLevel, fmt.Sprintf("%s.sql_log_level", path), "must be one of: silent, error, warn, info"))
+		}
+	}
+
+	if props.TLSMinVersion != "" {
+		switch props.TLSMinVersion {
+		case "1.0", "1.1", "1.2", "1.3", "TLS1.0", "TLS1.1", "TLS1.2", "TLS1.3", "TLSv1.0", "TLSv1.1", "TLSv1.2", "TLSv1.3":
+		default:
+			errs = errs.Also(apis.ErrInvalidValue(props.TLSMinVersion, fmt.Sprintf("%s.tls_min_version", path), "must be one of: 1.0, 1.1, 1.2, 1.3"))
+		}
+	}
+
+	errs = errs.Also(validatePort(props.ProfilingPort, fmt.Sprintf("%s.profiling_port", path)))
+	errs = errs.Also(validateNonNegativeInt(props.DBMaxIdleConnections, fmt.Sprintf("%s.db_max_idle_connections", path)))
+	errs = errs.Also(validateNonNegativeInt(props.DBMaxOpenConnections, fmt.Sprintf("%s.db_max_open_connections", path)))
+	errs = errs.Also(validateNonNegativeInt(props.GRPCWorkerPool, fmt.Sprintf("%s.grpc_worker_pool", path)))
+	errs = errs.Also(validateNonNegativeInt(props.ConverterDBLimit, fmt.Sprintf("%s.converter_db_limit", path)))
+	return errs
+}
+
+func validateNonNegativeInt(value *int64, field string) *apis.FieldError {
+	if value == nil || *value >= 0 {
+		return nil
+	}
+	return apis.ErrInvalidValue(*value, field, "must be greater than or equal to 0")
+}
+
+func validatePort(value *int64, field string) *apis.FieldError {
+	if value == nil || (*value >= 1 && *value <= 65535) {
+		return nil
+	}
+	return apis.ErrInvalidValue(*value, field, "must be between 1 and 65535")
+}
+
+// validateRouteTLSTermination validates that the route TLS termination type is one of the
+// supported values. It is called from both TektonResult and TektonConfig validators so that
+// unsupported values are rejected at the parent (TektonConfig) level as well.
+func (props ResultsAPIProperties) validateRouteTLSTermination(path string) *apis.FieldError {
+	if props.RouteTLSTermination == "" {
+		return nil
+	}
+	switch props.RouteTLSTermination {
+	case "edge", "reencrypt", "passthrough":
+		return nil
+	default:
+		errMsg := fmt.Sprintf("unsupported route TLS termination type %q, must be one of: edge, reencrypt, passthrough", props.RouteTLSTermination)
+		return apis.ErrInvalidValue(props.RouteTLSTermination, fmt.Sprintf("%s.route_tls_termination", path), errMsg)
+	}
 }
