@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"mime/multipart"
 	"net/http"
+	"strings"
 
 	"github.com/go-openapi/errors"
 )
@@ -70,11 +71,16 @@ type FileBinder func(file multipart.File, header *multipart.FileHeader) error
 // behaviour) be added without breaking the signature.
 type BindOption func(*bindConfig)
 
-type bindConfig struct {
-	maxParseMemory int64
+type multipartFormLimits struct {
 	maxBody        int64
 	maxFiles       int
 	maxFilenameLen int
+}
+
+type bindConfig struct {
+	multipartFormLimits
+
+	maxParseMemory int64
 	files          []formFileSpec
 }
 
@@ -197,7 +203,9 @@ func BindFormFile(name string, required bool, bind FileBinder) BindOption {
 //     it directly as a filesystem path.
 func BindForm(r *http.Request, opts ...BindOption) (fatal bool, err error) {
 	cfg := bindConfig{
-		maxFilenameLen: DefaultMaxUploadFilenameLength,
+		multipartFormLimits: multipartFormLimits{
+			maxFilenameLen: DefaultMaxUploadFilenameLength,
+		},
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -281,8 +289,55 @@ func countFileParts(r *http.Request) int {
 	return n
 }
 
+// FormFile resolves a file field from a parsed form body, transparently
+// handling both content types accepted for `type: file` parameters by
+// the OpenAPI 2.0 spec:
+//
+//   - multipart/form-data — delegates to [http.Request.FormFile].
+//   - application/x-www-form-urlencoded — looks up the field in
+//     r.PostForm and synthesizes a [multipart.File] backed by the
+//     value bytes plus a [multipart.FileHeader] with Filename equal
+//     to the field name and Size set to the byte length.
+//
+// Returns [http.ErrMissingFile] when the field is absent under either
+// content type. Callers must have parsed the body upstream (e.g. via
+// [BindForm] or [http.Request.ParseForm]) before reading from the
+// urlencoded path — [http.Request.FormFile] takes care of parsing on
+// the multipart path.
+//
+// Presence is the only criterion for binding a urlencoded file: an
+// empty value (e.g. `file=`) is bound as a zero-byte file.
+func FormFile(r *http.Request, name string) (multipart.File, *multipart.FileHeader, error) {
+	file, header, err := r.FormFile(name)
+	if err == nil {
+		return file, header, nil
+	}
+	if !stderrors.Is(err, http.ErrNotMultipart) {
+		return nil, nil, err
+	}
+
+	values, present := r.PostForm[name]
+	if !present {
+		return nil, nil, http.ErrMissingFile
+	}
+	value := values[0]
+	return urlencodedFile{Reader: strings.NewReader(value)},
+		&multipart.FileHeader{Filename: name, Size: int64(len(value))},
+		nil
+}
+
+// urlencodedFile adapts a urlencoded form value (already buffered in
+// memory by [http.Request.ParseForm]) to the [multipart.File]
+// interface. The embedded [strings.Reader] supplies Read/ReadAt/Seek;
+// Close is a no-op since there is no resource to release.
+type urlencodedFile struct {
+	*strings.Reader
+}
+
+func (urlencodedFile) Close() error { return nil }
+
 func bindFormFile(r *http.Request, spec formFileSpec, maxFilenameLen int) error {
-	file, header, err := r.FormFile(spec.name)
+	file, header, err := FormFile(r, spec.name)
 	if err != nil {
 		if stderrors.Is(err, http.ErrMissingFile) {
 			if spec.required {

@@ -32,9 +32,9 @@ type TektonConfigExpansion interface{}
 
 type TektonDashboardExpansion interface{}
 
-type TektonHubExpansion interface{}
-
 type TektonInstallerSetExpansion interface{}
+
+type TektonKueueExpansion interface{}
 
 type TektonMulticlusterProxyAAEExpansion interface{}
 

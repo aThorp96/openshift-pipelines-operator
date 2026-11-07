@@ -8,7 +8,7 @@ You may obtain a copy of the License at
     http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" B]>SIS,
+distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
@@ -18,8 +18,10 @@ package tektonresult
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -104,6 +106,7 @@ func (r *Reconciler) transform(ctx context.Context, manifest *mf.Manifest, comp 
 		common.ReplaceNamespaceInDeploymentEnv(resultDeployementNames, targetNs),
 		updateApiConfig(instance.Spec),
 		updateApiEnv(instance.Spec),
+		applyResultAPIPerformance(instance.Spec.Performance),
 		enablePVCLogging(instance.Spec.ResultsAPIProperties),
 		updateEnvWithSecretName(instance.Spec.ResultsAPIProperties),
 		updateEnvWithDBSecretName(instance.Spec.ResultsAPIProperties),
@@ -115,7 +118,11 @@ func (r *Reconciler) transform(ctx context.Context, manifest *mf.Manifest, comp 
 		common.DeploymentEnvVarKubernetesMinVersion(),
 		common.StatefulSetImages(resultImgs),
 		common.AddConfigMapValues(tektonResultleaderElectionConfig, instance.Spec.Performance.PerformanceLeaderElectionConfig),
-		common.UpdatePerformanceFlagsInDeploymentAndLeaderConfigMap(&instance.Spec.Performance, tektonResultleaderElectionConfig, resultWatcherDeployment, resultWatcherContainer),
+		// The shared helper names flags from the CRD json tags. The Results
+		// watcher accepts -qps and -burst, and exits if it sees -kube-api-qps
+		// or -kube-api-burst. Those two values are applied below.
+		common.UpdatePerformanceFlagsInDeploymentAndLeaderConfigMap(performanceWithoutClientFlags(instance.Spec.Performance), tektonResultleaderElectionConfig, resultWatcherDeployment, resultWatcherContainer),
+		updateWatcherFlagsInDeployment(&instance.Spec.Watcher, resultWatcherDeployment, resultWatcherContainer),
 		// Note: PostgreSQL upgrade transformer is NOT needed for Kubernetes
 	}
 
@@ -387,12 +394,18 @@ func updateApiEnv(s v1alpha1.TektonResultSpec) mf.Transformer {
 			}
 
 			replaceEnv(existingContainerEnv, prop)
-			for k, v := range prop {
-				newEnv := corev1.EnvVar{
+			// Sort keys so env order is stable across transforms. Unordered map
+			// iteration would change Deployment Spec hashes and roll pods.
+			keys := make([]string, 0, len(prop))
+			for k := range prop {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				existingContainerEnv = append(existingContainerEnv, corev1.EnvVar{
 					Name:  k,
-					Value: v,
-				}
-				existingContainerEnv = append(existingContainerEnv, newEnv)
+					Value: prop[k],
+				})
 			}
 			dep.Spec.Template.Spec.Containers[containerIndex].Env = existingContainerEnv
 			break
@@ -584,6 +597,148 @@ func updateEnvWithSecretName(props v1alpha1.ResultsAPIProperties) mf.Transformer
 
 }
 
+// applyResultAPIPerformance copies kube-api-qps and kube-api-burst onto the
+// Results API and the watcher. The API stores them as K8S_QPS and K8S_BURST.
+// The watcher stores them as -qps and -burst.
+func applyResultAPIPerformance(perf v1alpha1.PerformanceProperties) mf.Transformer {
+	env := map[string]string{}
+	args := map[string]string{}
+	if perf.KubeApiQPS != nil {
+		// The API field is an integer. A fractional QPS is truncated.
+		env["K8S_QPS"] = strconv.Itoa(int(*perf.KubeApiQPS))
+		// The watcher flag is a float, so the fractional value is kept.
+		args["qps"] = strconv.FormatFloat(float64(*perf.KubeApiQPS), 'f', -1, 32)
+	}
+	if perf.KubeApiBurst != nil {
+		env["K8S_BURST"] = strconv.Itoa(*perf.KubeApiBurst)
+		args["burst"] = strconv.Itoa(*perf.KubeApiBurst)
+	}
+	return func(u *unstructured.Unstructured) error {
+		if len(env) == 0 {
+			return nil
+		}
+		switch u.GetKind() {
+		case "Deployment":
+			switch u.GetName() {
+			case deploymentAPI:
+				return setContainerEnv(u, apiContainerName, env)
+			case resultWatcherDeployment:
+				return setContainerArgs(u, resultWatcherContainer, args)
+			default:
+				return nil
+			}
+		case "ConfigMap":
+			if u.GetName() != configAPI {
+				return nil
+			}
+			return setConfigMapKeys(u, env)
+		default:
+			return nil
+		}
+	}
+}
+
+// performanceWithoutClientFlags returns a copy of perf without kube-api-qps and
+// kube-api-burst, so the shared watcher helper does not pass those flag names.
+func performanceWithoutClientFlags(perf v1alpha1.PerformanceProperties) *v1alpha1.PerformanceProperties {
+	perf.KubeApiQPS = nil
+	perf.KubeApiBurst = nil
+	return &perf
+}
+
+func setContainerEnv(u *unstructured.Unstructured, containerName string, env map[string]string) error {
+	dep := &appsv1.Deployment{}
+	if err := k8sruntime.DefaultUnstructuredConverter.FromUnstructured(u.Object, dep); err != nil {
+		return err
+	}
+	names := make([]string, 0, len(env))
+	for name := range env {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for i, container := range dep.Spec.Template.Spec.Containers {
+		if container.Name != containerName {
+			continue
+		}
+		for _, name := range names {
+			value := env[name]
+			updated := false
+			for j := range container.Env {
+				if container.Env[j].Name != name {
+					continue
+				}
+				container.Env[j].Value = value
+				container.Env[j].ValueFrom = nil
+				updated = true
+				break
+			}
+			if !updated {
+				container.Env = append(container.Env, corev1.EnvVar{Name: name, Value: value})
+			}
+		}
+		dep.Spec.Template.Spec.Containers[i].Env = container.Env
+		break
+	}
+	obj, err := k8sruntime.DefaultUnstructuredConverter.ToUnstructured(dep)
+	if err != nil {
+		return err
+	}
+	u.SetUnstructuredContent(obj)
+	return nil
+}
+
+func setContainerArgs(u *unstructured.Unstructured, containerName string, args map[string]string) error {
+	dep := &appsv1.Deployment{}
+	if err := k8sruntime.DefaultUnstructuredConverter.FromUnstructured(u.Object, dep); err != nil {
+		return err
+	}
+	names := make([]string, 0, len(args))
+	for name := range args {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for i, container := range dep.Spec.Template.Spec.Containers {
+		if container.Name != containerName {
+			continue
+		}
+		for _, name := range names {
+			container.Args = replaceOrAppendContainerArg(container.Args, name, args[name])
+		}
+		dep.Spec.Template.Spec.Containers[i].Args = container.Args
+		break
+	}
+	obj, err := k8sruntime.DefaultUnstructuredConverter.ToUnstructured(dep)
+	if err != nil {
+		return err
+	}
+	u.SetUnstructuredContent(obj)
+	return nil
+}
+
+func setConfigMapKeys(u *unstructured.Unstructured, env map[string]string) error {
+	cm := &corev1.ConfigMap{}
+	if err := k8sruntime.DefaultUnstructuredConverter.FromUnstructured(u.Object, cm); err != nil {
+		return err
+	}
+	if cm.Data == nil {
+		cm.Data = map[string]string{}
+	}
+	lines := strings.Split(cm.Data["config"], "\n")
+	for i := range lines {
+		name := strings.SplitN(lines[i], "=", 2)[0]
+		if val, ok := env[name]; ok {
+			lines[i] = fmt.Sprintf("%s=%s", name, val)
+		}
+	}
+	cm.Data["config"] = strings.Join(lines, "\n")
+	obj, err := k8sruntime.DefaultUnstructuredConverter.ToUnstructured(cm)
+	if err != nil {
+		return err
+	}
+	u.SetUnstructuredContent(obj)
+	return nil
+}
+
 func replaceEnv(envs []corev1.EnvVar, prop map[string]string) {
 	for i, env := range envs {
 		_, ok := prop[env.Name]
@@ -675,4 +830,134 @@ func updateEnvWithDBSecretName(props v1alpha1.ResultsAPIProperties) mf.Transform
 		u.SetUnstructuredContent(uObj)
 		return nil
 	}
+}
+
+// updateWatcherFlagsInDeployment injects Tekton Results Watcher configuration
+// as command-line flags on the watcher deployment container.
+func updateWatcherFlagsInDeployment(watcher *v1alpha1.ResultsWatcherProperties, deploymentName, containerName string) mf.Transformer {
+	return func(u *unstructured.Unstructured) error {
+		if watcher == nil {
+			return nil
+		}
+		if u.GetKind() != "Deployment" || u.GetName() != deploymentName {
+			return nil
+		}
+
+		flags := map[string]interface{}{}
+		if err := common.StructToMap(watcher, &flags); err != nil {
+			return err
+		}
+		if len(flags) == 0 {
+			return nil
+		}
+
+		dep := &appsv1.Deployment{}
+		err := k8sruntime.DefaultUnstructuredConverter.FromUnstructured(u.Object, dep)
+		if err != nil {
+			return err
+		}
+
+		podLabels := dep.Spec.Template.Labels
+		if podLabels == nil {
+			podLabels = map[string]string{}
+		}
+		// Hash label values so free-text settings (summary_labels, label_selector, etc.)
+		// always produce valid Kubernetes label values. Labels only force a pod restart
+		// when config changes; they do not need to be human-readable.
+		flagKeys := sortedFlagKeys(flags)
+		for _, key := range flagKeys {
+			labelKey := fmt.Sprintf("%s.data.%s", deploymentName, key)
+			podLabels[labelKey] = hashLabelValue(fmt.Sprintf("%v", flags[key]))
+		}
+		dep.Spec.Template.Labels = podLabels
+
+		for containerIndex, container := range dep.Spec.Template.Spec.Containers {
+			if container.Name != containerName {
+				continue
+			}
+			for _, flagKey := range flagKeys {
+				argStringValue := fmt.Sprintf("%v", flags[flagKey])
+				container.Args = replaceOrAppendContainerArg(container.Args, flagKey, argStringValue)
+			}
+			dep.Spec.Template.Spec.Containers[containerIndex] = container
+		}
+
+		obj, err := k8sruntime.DefaultUnstructuredConverter.ToUnstructured(dep)
+		if err != nil {
+			return err
+		}
+		u.SetUnstructuredContent(obj)
+
+		return nil
+	}
+}
+
+// hashLabelValue returns a short SHA-256 hex digest that is always a valid
+// Kubernetes label value (letters/digits only, within the 63-char limit).
+func hashLabelValue(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	// Full SHA-256 hex is 64 chars; Kubernetes label values max out at 63.
+	const hashLabelLen = 32
+	return fmt.Sprintf("%x", sum)[:hashLabelLen]
+}
+
+// replaceOrAppendContainerArg updates container args for flagKey.
+// It handles both "-flag=value" and two-element ("-flag", "value") forms by
+// removing any existing match (and its separate value, if present) before
+// appending the combined "-flag=value" form.
+func replaceOrAppendContainerArg(args []string, flagKey, value string) []string {
+	expectedArg := fmt.Sprintf("-%s", flagKey)
+	newArg := fmt.Sprintf("%s=%s", expectedArg, value)
+
+	out := make([]string, 0, len(args))
+	replaced := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == expectedArg || strings.HasPrefix(arg, expectedArg+"=") {
+			// Skip a separate value entry from the two-element form, including
+			// negative durations like "-1h" that also start with '-'.
+			if arg == expectedArg && i+1 < len(args) && isFlagValueToken(args[i+1]) {
+				i++
+			}
+			if !replaced {
+				out = append(out, newArg)
+				replaced = true
+			}
+			continue
+		}
+		out = append(out, arg)
+	}
+	if !replaced {
+		out = append(out, newArg)
+	}
+	return out
+}
+
+// isFlagValueToken reports whether s is a value for a bare "-flag" form.
+// Flag names start with a letter after the dash (e.g. -api_addr). Values may
+// start with '-' when they are negative numbers/durations (e.g. -1h).
+func isFlagValueToken(s string) bool {
+	if s == "" {
+		return true
+	}
+	if strings.HasPrefix(s, "--") {
+		return false
+	}
+	if strings.HasPrefix(s, "-") && len(s) > 1 {
+		c := s[1]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			return false
+		}
+	}
+	return true
+}
+
+func sortedFlagKeys(flags map[string]interface{}) []string {
+	keys := make([]string, 0, len(flags))
+	for key := range flags {
+		keys = append(keys, key)
+	}
+	// Keep deterministic order for installerset hashing / stable manifests.
+	sort.Strings(keys)
+	return keys
 }

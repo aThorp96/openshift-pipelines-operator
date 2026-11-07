@@ -18,6 +18,7 @@ package common
 
 import (
 	"context"
+	cryptotls "crypto/tls"
 	"errors"
 	"fmt"
 	"strings"
@@ -27,6 +28,7 @@ import (
 	configv1 "github.com/openshift/api/config/v1"
 	openshiftconfigclient "github.com/openshift/client-go/config/clientset/versioned"
 	configv1listers "github.com/openshift/client-go/config/listers/config/v1"
+	"github.com/openshift/library-go/pkg/crypto"
 	"github.com/openshift/library-go/pkg/operator/configobserver/apiserver"
 	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/resourcesynccontroller"
@@ -46,8 +48,9 @@ const (
 	// TLS_CIPHER_SUITES: comma-separated IANA cipher suite names,
 	// e.g. "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_AES_128_GCM_SHA256"
 	TLSCipherSuitesEnvVar = "TLS_CIPHER_SUITES"
-	// TLS_CURVE_PREFERENCES: comma-separated elliptic curve names (not yet populated;
-	// defaults to Go standard library values until openshift/api#2583 is merged)
+	// TLS_CURVE_PREFERENCES: comma-separated curve names for Go/Knative TLS
+	// (e.g. "X25519MLKEM768,X25519,P-256,P-384"). OpenShift API TLSGroup names
+	// (secp256r1) are converted before injection — knative.dev/pkg rejects API names.
 	TLSCurvePreferencesEnvVar = "TLS_CURVE_PREFERENCES"
 
 	// WebhookEnvVarPrefix is prepended to the TLS env var names when injecting into
@@ -123,11 +126,12 @@ func SetSharedAPIServerLister(lister configv1listers.APIServerLister, client ope
 }
 
 // TLSProfileConfig holds the raw TLS profile data as extracted from the APIServer resource.
-// Values are in library-go / OpenShift API format (e.g. "VersionTLS12", IANA cipher names).
+// Values are in library-go / OpenShift API format (e.g. "VersionTLS12", IANA cipher names,
+// TLSGroup names such as "X25519MLKEM768" / "secp256r1").
 type TLSProfileConfig struct {
 	MinTLSVersion    string
 	CipherSuites     []string
-	CurvePreferences []string // Not yet populated; will be set once openshift/api#2583 is merged
+	CurvePreferences []string
 }
 
 // GetTLSProfileFromAPIServer fetches the raw TLS security profile from the OpenShift APIServer
@@ -137,7 +141,6 @@ func GetTLSProfileFromAPIServer(ctx context.Context) (*TLSProfileConfig, error) 
 
 	sharedListerMu.RLock()
 	lister := sharedAPIServerLister
-	client := sharedConfigClient
 	sharedListerMu.RUnlock()
 
 	if lister == nil {
@@ -149,14 +152,23 @@ func GetTLSProfileFromAPIServer(ctx context.Context) (*TLSProfileConfig, error) 
 		lister: lister,
 	}
 
-	// Use library-go's ObserveTLSSecurityProfile to extract TLS config.
-	// Note: ObserveTLSSecurityProfile requires:
-	// - non-nil recorder: it calls recorder.Eventf() to log changes
-	// - non-nil existingConfig: it reads from it via unstructured.NestedString()
-	// TODO: Once library-go is updated to a newer version (with TLS 1.3 cipher support),
-	// the supplementTLS13Ciphers workaround below can be removed.
+	// Use library-go's ObserveTLSSecurityProfileWithGroupPaths to extract minTLSVersion,
+	// cipherSuites, and TLS group (curve) preferences from the cluster APIServer profile.
+	// Requires a non-nil recorder (for Eventf calls) and a non-nil existingConfig
+	// (read via unstructured.NestedString).
+	// The returned cipher list includes both TLS 1.2 and TLS 1.3 IANA names because
+	// library-go's OpenSSLToIANACipherSuites maps TLS 1.3 names (TLS_AES_*,
+	// TLS_CHACHA20_POLY1305_SHA256) as identity values.
+	// Groups are FIPS-filtered by library-go when the Go runtime is in FIPS mode.
 	existingConfig := map[string]interface{}{}
-	observedConfig, errs := apiserver.ObserveTLSSecurityProfile(listers, noOpRecorder{}, existingConfig)
+	observedConfig, errs := apiserver.ObserveTLSSecurityProfileWithGroupPaths(
+		listers,
+		noOpRecorder{},
+		existingConfig,
+		[]string{"servingInfo", "minTLSVersion"},
+		[]string{"servingInfo", "cipherSuites"},
+		[]string{"servingInfo", "curvePreferences"},
+	)
 	if len(errs) > 0 {
 		return nil, errors.Join(errs...)
 	}
@@ -177,30 +189,34 @@ func GetTLSProfileFromAPIServer(ctx context.Context) (*TLSProfileConfig, error) 
 		}
 	}
 
-	if minVersion == "" && len(cipherSuites) == 0 {
-		return nil, nil
+	var curvePreferences []string
+	if groups, ok := servingInfo["curvePreferences"].([]interface{}); ok {
+		for _, g := range groups {
+			if gs, ok := g.(string); ok {
+				curvePreferences = append(curvePreferences, gs)
+			}
+		}
 	}
 
-	// Supplement TLS 1.3 ciphers if needed
-	// TODO: Remove this once library-go is updated with proper TLS 1.3 cipher mapping
-	if client != nil {
-		apiServer, err := lister.Get("cluster")
-		if err != nil {
-			logger.Warnf("Failed to get APIServer for TLS 1.3 cipher supplementation: %v", err)
-		} else if apiServer.Spec.TLSSecurityProfile != nil {
-			cipherSuites = supplementTLS13Ciphers(apiServer.Spec.TLSSecurityProfile, cipherSuites)
-		}
+	if minVersion == "" && len(cipherSuites) == 0 && len(curvePreferences) == 0 {
+		return nil, nil
 	}
 
 	return &TLSProfileConfig{
 		MinTLSVersion:    minVersion,
 		CipherSuites:     cipherSuites,
-		CurvePreferences: nil,
+		CurvePreferences: curvePreferences,
 	}, nil
 }
 
 // TLSEnvVarsFromProfile validates and converts a raw TLSProfileConfig to TLSEnvVars
 // suitable for injection into component deployments.
+//
+// CurvePreferences are remapped from OpenShift API TLSGroup names (secp256r1)
+// to the names accepted by knative.dev/pkg network/tls (P-256, X25519, …).
+// Injecting API names verbatim crashes Knative webhooks with:
+//
+//	invalid WEBHOOK_TLS_CURVE_PREFERENCES: unknown curve "secp256r1"
 func TLSEnvVarsFromProfile(cfg *TLSProfileConfig) (*TLSEnvVars, error) {
 	if cfg == nil {
 		return nil, nil
@@ -214,8 +230,68 @@ func TLSEnvVarsFromProfile(cfg *TLSProfileConfig) (*TLSEnvVars, error) {
 	return &TLSEnvVars{
 		MinVersion:       envMinVersion,
 		CipherSuites:     strings.Join(cfg.CipherSuites, ","),
-		CurvePreferences: strings.Join(cfg.CurvePreferences, ","),
+		CurvePreferences: joinKnativeCurvePreferences(cfg.CurvePreferences),
 	}, nil
+}
+
+// joinKnativeCurvePreferences converts OpenShift API TLSGroup names to a
+// comma-separated list accepted by knative.dev/pkg/network/tls parseCurvePreferences
+// (P-256 / X25519 / X25519MLKEM768, …). Unknown groups are dropped so a future
+// API-only name cannot CrashLoop the webhook.
+func joinKnativeCurvePreferences(apiGroups []string) string {
+	out := make([]string, 0, len(apiGroups))
+	for _, g := range apiGroups {
+		if name, ok := apiTLSGroupToKnativeCurve(g); ok {
+			out = append(out, name)
+		}
+	}
+	return strings.Join(out, ",")
+}
+
+// knativeCurveNameByID maps Go CurveIDs to the env-string form Knative accepts.
+// Prefer the P-* / X25519 names from knative.dev/pkg/network/tls curvesByName
+// (https://github.com/knative/pkg/blob/main/network/tls/config.go).
+// SecP*MLKEM* IDs are omitted until Knative lists them.
+var knativeCurveNameByID = map[cryptotls.CurveID]string{
+	cryptotls.CurveP256:      "P-256",
+	cryptotls.CurveP384:      "P-384",
+	cryptotls.CurveP521:      "P-521",
+	cryptotls.X25519:         "X25519",
+	cryptotls.X25519MLKEM768: "X25519MLKEM768",
+}
+
+// knativeCurveByName mirrors knative.dev/pkg/network/tls curvesByName so that
+// values already in Knative form (P-256, CurveP256) normalize correctly.
+var knativeCurveByName = map[string]cryptotls.CurveID{
+	"CurveP256":      cryptotls.CurveP256,
+	"CurveP384":      cryptotls.CurveP384,
+	"CurveP521":      cryptotls.CurveP521,
+	"X25519":         cryptotls.X25519,
+	"X25519MLKEM768": cryptotls.X25519MLKEM768,
+	"P-256":          cryptotls.CurveP256,
+	"P-384":          cryptotls.CurveP384,
+	"P-521":          cryptotls.CurveP521,
+}
+
+// apiTLSGroupToKnativeCurve maps an OpenShift API TLSGroup (or a Knative alias)
+// to a name in knative curvesByName.
+//
+// Path: API string → library-go TLSGroupToCurveID → knativeCurveNameByID.
+// If the string is already a Knative alias, resolve via knativeCurveByName.
+func apiTLSGroupToKnativeCurve(group string) (string, bool) {
+	group = strings.TrimSpace(group)
+	if group == "" {
+		return "", false
+	}
+	if id, ok := crypto.TLSGroupToCurveID(configv1.TLSGroup(group)); ok {
+		name, ok := knativeCurveNameByID[id]
+		return name, ok
+	}
+	if id, ok := knativeCurveByName[group]; ok {
+		name, ok := knativeCurveNameByID[id]
+		return name, ok
+	}
+	return "", false
 }
 
 // TektonConfigLister abstracts access to TektonConfig resources.
@@ -234,7 +310,8 @@ func ResolveCentralTLSToEnvVars(ctx context.Context, lister TektonConfigLister) 
 
 	// nil means the field was not set → treat as true (default-on after SetDefaults).
 	// Explicitly false means the user opted out.
-	if tc.Spec.Platforms.OpenShift.EnableCentralTLSConfig != nil &&
+	if tc.Spec.Platforms.OpenShift != nil &&
+		tc.Spec.Platforms.OpenShift.EnableCentralTLSConfig != nil &&
 		!*tc.Spec.Platforms.OpenShift.EnableCentralTLSConfig {
 		return nil, nil
 	}
@@ -242,8 +319,8 @@ func ResolveCentralTLSToEnvVars(ctx context.Context, lister TektonConfigLister) 
 	// Note: GetTLSProfileFromAPIServer returns the cluster's effective TLS profile,
 	// which currently defaults to the Intermediate profile when no explicit
 	// .spec.tlsSecurityProfile is set on the APIServer resource. This is consistent
-	// with library-go's ObserveTLSSecurityProfile behavior used by other OpenShift
-	// components.
+	// with library-go's ObserveTLSSecurityProfileWithGroupPaths behavior used by
+	// other OpenShift components.
 	profile, err := GetTLSProfileFromAPIServer(ctx)
 	if err != nil || profile == nil {
 		return nil, err
@@ -360,57 +437,4 @@ func mergeEnvVarsIntoContainers(containers []corev1.Container, names []string, e
 		}
 		containers[i].Env = existing
 	}
-}
-
-// supplementTLS13Ciphers adds TLS 1.3 ciphers that the older library-go version doesn't map.
-// TLS 1.3 ciphers are mandatory per RFC 8446 and are always enabled when TLS 1.3 is used,
-// but we include them explicitly for completeness.
-// TODO: Remove this function once library-go is updated to a version that properly maps TLS 1.3 ciphers.
-func supplementTLS13Ciphers(profile *configv1.TLSSecurityProfile, observedCiphers []string) []string {
-	if profile == nil {
-		return observedCiphers
-	}
-
-	// Get the profile spec that defines the configured ciphers
-	var profileSpec *configv1.TLSProfileSpec
-	switch profile.Type {
-	case configv1.TLSProfileCustomType:
-		if profile.Custom != nil {
-			profileSpec = &profile.Custom.TLSProfileSpec
-		}
-	case configv1.TLSProfileModernType:
-		profileSpec = configv1.TLSProfiles[configv1.TLSProfileModernType]
-	case configv1.TLSProfileIntermediateType:
-		profileSpec = configv1.TLSProfiles[configv1.TLSProfileIntermediateType]
-	case configv1.TLSProfileOldType:
-		profileSpec = configv1.TLSProfiles[configv1.TLSProfileOldType]
-	}
-
-	if profileSpec == nil {
-		return observedCiphers
-	}
-
-	// Build a set of already observed ciphers for quick lookup
-	observedSet := make(map[string]bool)
-	for _, c := range observedCiphers {
-		observedSet[c] = true
-	}
-
-	// TLS 1.3 cipher suite names (IANA names)
-	tls13Ciphers := map[string]bool{
-		"TLS_AES_128_GCM_SHA256":       true,
-		"TLS_AES_256_GCM_SHA384":       true,
-		"TLS_CHACHA20_POLY1305_SHA256": true,
-	}
-
-	// Check configured ciphers for TLS 1.3 ciphers that library-go might have missed
-	result := observedCiphers
-	for _, cipher := range profileSpec.Ciphers {
-		// If it's a TLS 1.3 cipher and not already in observed list, add it
-		if tls13Ciphers[cipher] && !observedSet[cipher] {
-			result = append(result, cipher)
-		}
-	}
-
-	return result
 }

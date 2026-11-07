@@ -18,6 +18,7 @@ package tektonconfig
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	mf "github.com/manifestival/manifestival"
@@ -26,18 +27,21 @@ import (
 	tektonConfigreconciler "github.com/tektoncd/operator/pkg/client/injection/reconciler/operator/v1alpha1/tektonconfig"
 	"github.com/tektoncd/operator/pkg/reconciler/common"
 	"github.com/tektoncd/operator/pkg/reconciler/shared/tektonconfig/chain"
+	"github.com/tektoncd/operator/pkg/reconciler/shared/tektonconfig/kueue"
+	"github.com/tektoncd/operator/pkg/reconciler/shared/tektonconfig/manualapprovalgate"
 	"github.com/tektoncd/operator/pkg/reconciler/shared/tektonconfig/multiclusterproxyaae"
 	"github.com/tektoncd/operator/pkg/reconciler/shared/tektonconfig/pipeline"
 	"github.com/tektoncd/operator/pkg/reconciler/shared/tektonconfig/pruner"
 	"github.com/tektoncd/operator/pkg/reconciler/shared/tektonconfig/result"
-	"github.com/tektoncd/operator/pkg/reconciler/shared/tektonconfig/scheduler"
 	"github.com/tektoncd/operator/pkg/reconciler/shared/tektonconfig/syncerservice"
 	"github.com/tektoncd/operator/pkg/reconciler/shared/tektonconfig/trigger"
 	"github.com/tektoncd/operator/pkg/reconciler/shared/tektonconfig/upgrade"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"knative.dev/pkg/apis"
 	"knative.dev/pkg/logging"
+	"knative.dev/pkg/ptr"
 	pkgreconciler "knative.dev/pkg/reconciler"
 )
 
@@ -78,6 +82,9 @@ func (r *Reconciler) FinalizeKind(ctx context.Context, original *v1alpha1.Tekton
 			return err
 		}
 		if err := chain.EnsureTektonChainCRNotExists(ctx, r.operatorClientSet.OperatorV1alpha1().TektonChains()); err != nil {
+			return err
+		}
+		if err := manualapprovalgate.EnsureManualApprovalGateCRNotExists(ctx, r.operatorClientSet.OperatorV1alpha1().ManualApprovalGates()); err != nil {
 			return err
 		}
 		if err := result.EnsureTektonResultCRNotExists(ctx, r.operatorClientSet.OperatorV1alpha1().TektonResults()); err != nil {
@@ -135,6 +142,10 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tc *v1alpha1.TektonConfi
 
 	// run pre upgrade
 	if err := r.upgrade.RunPreUpgrade(ctx); err != nil {
+		if errors.Is(err, v1alpha1.REQUEUE_EVENT_AFTER) {
+			logger.Infow("Pre-upgrade requested requeue", "error", err)
+			return err
+		}
 		logger.Errorw("Pre-upgrade failed", "error", err)
 		return err
 	}
@@ -224,18 +235,18 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tc *v1alpha1.TektonConfi
 		}
 	}
 
-	// Ensure TektonMulticlusterProxyAAE CR (conditional based on scheduler multi-cluster config).
-	// Run before EnsureSchedulerComponent so the CR is created even when scheduler component
+	// Ensure TektonMulticlusterProxyAAE CR (conditional based on kueue multi-cluster config).
+	// Run before EnsureKueueComponent so the CR is created even when kueue component
 	// is blocked (e.g. cert-manager or Kueue not installed). Multicluster-proxy-aae is deployed only when:
-	// - Scheduler is enabled (not disabled)
+	// - Kueue is enabled (not disabled)
 	// - multi-cluster-disabled: false
 	// - multi-cluster-role: Hub
 	proxyAAEEnabled := multiclusterproxyaae.IsMulticlusterProxyAAEEnabled(tc)
 	logger.Infow("TektonMulticlusterProxyAAE enablement",
 		"enabled", proxyAAEEnabled,
-		"schedulerDisabled", tc.Spec.Scheduler.IsDisabled(),
-		"multiClusterDisabled", tc.Spec.Scheduler.MultiClusterDisabled,
-		"multiClusterRole", tc.Spec.Scheduler.MultiClusterRole)
+		"kueueDisabled", tc.Spec.Kueue.IsDisabled(),
+		"multiClusterDisabled", tc.Spec.Kueue.MultiClusterDisabled,
+		"multiClusterRole", tc.Spec.Kueue.MultiClusterRole)
 	if proxyAAEEnabled {
 		proxyCR := multiclusterproxyaae.GetTektonMulticlusterProxyAAECR(tc, r.operatorVersion)
 		logger.Debug("Ensuring TektonMulticlusterProxyAAE CR exists (multi-cluster enabled with Hub role)")
@@ -251,9 +262,9 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tc *v1alpha1.TektonConfi
 		logger.Debug("TektonMulticlusterProxyAAE CR reconciled successfully")
 	} else {
 		logger.Debugw("Ensuring TektonMulticlusterProxyAAE CR doesn't exist",
-			"schedulerDisabled", tc.Spec.Scheduler.IsDisabled(),
-			"multiClusterDisabled", tc.Spec.Scheduler.MultiClusterDisabled,
-			"multiClusterRole", tc.Spec.Scheduler.MultiClusterRole)
+			"kueueDisabled", tc.Spec.Kueue.IsDisabled(),
+			"multiClusterDisabled", tc.Spec.Kueue.MultiClusterDisabled,
+			"multiClusterRole", tc.Spec.Kueue.MultiClusterRole)
 		if err := multiclusterproxyaae.EnsureTektonMulticlusterProxyAAECRNotExists(ctx, r.operatorClientSet.OperatorV1alpha1().TektonMulticlusterProxyAAEs()); err != nil {
 			if err == v1alpha1.RECONCILE_AGAIN_ERR {
 				return v1alpha1.REQUEUE_EVENT_AFTER
@@ -266,7 +277,7 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tc *v1alpha1.TektonConfi
 		logger.Debug("TektonMulticlusterProxyAAE CR removal reconciled successfully")
 	}
 
-	if err := r.EnsureSchedulerComponent(ctx, tc); err != nil {
+	if err := r.EnsureKueueComponent(ctx, tc); err != nil {
 		return err
 	}
 
@@ -299,8 +310,14 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tc *v1alpha1.TektonConfi
 	}
 
 	// Ensure Chain CR
-	if !tc.Spec.Chain.Disabled {
+	if !tc.Spec.Chain.Disabled && (tc.Spec.Profile == v1alpha1.ProfileAll || tc.Spec.Profile == v1alpha1.ProfileBasic) {
 		tektonchain := chain.GetTektonChainCR(tc, r.operatorVersion)
+		if platformData := r.extension.GetPlatformData(); platformData != "" {
+			if tektonchain.Annotations == nil {
+				tektonchain.Annotations = map[string]string{}
+			}
+			tektonchain.Annotations[v1alpha1.PlatformDataHashKey] = platformData
+		}
 		logger.Debug("Ensuring TektonChain CR exists")
 		if _, err := chain.EnsureTektonChainExists(ctx, r.operatorClientSet.OperatorV1alpha1().TektonChains(), tektonchain); err != nil {
 			errMsg := fmt.Sprintf("TektonChain: %s", err.Error())
@@ -310,7 +327,7 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tc *v1alpha1.TektonConfi
 		}
 		logger.Debug("TektonChain CR reconciled successfully")
 	} else {
-		logger.Debugw("Ensuring TektonChain CR doesn't exist", "chainDisabled", tc.Spec.Chain.Disabled)
+		logger.Debugw("Ensuring TektonChain CR doesn't exist", "profile", tc.Spec.Profile, "chainDisabled", tc.Spec.Chain.Disabled)
 		if err := chain.EnsureTektonChainCRNotExists(ctx, r.operatorClientSet.OperatorV1alpha1().TektonChains()); err != nil {
 			errMsg := fmt.Sprintf("TektonChain: %s", err.Error())
 			logger.Errorw("Failed to ensure TektonChain has been deleted", "error", err)
@@ -320,8 +337,60 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tc *v1alpha1.TektonConfi
 		logger.Debug("TektonChain CR removal reconciled successfully")
 	}
 
+	// Ensure ManualApprovalGate CR
+	// If a standalone MAG CR exists (no ownerRef, from a previous version),
+	// adopt its config into TektonConfig and enable it.
+	if tc.Spec.ManualApproval.IsDisabled() {
+		existingMAG, err := manualapprovalgate.GetManualApprovalGate(ctx, r.operatorClientSet.OperatorV1alpha1().ManualApprovalGates(), v1alpha1.ManualApprovalGates)
+
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				// Transient error — can't determine whether a standalone MAG
+				// exists, so don't proceed to the delete branch.
+				logger.Warnw("Transient error checking for standalone ManualApprovalGate CR, will retry", "error", err)
+				return v1alpha1.REQUEUE_EVENT_AFTER
+			}
+			// NotFound — no standalone MAG, fall through to delete branch (correct)
+		} else if len(existingMAG.OwnerReferences) == 0 {
+			logger.Infow("Found standalone ManualApprovalGate CR from previous version, adopting into TektonConfig")
+			tc.Spec.ManualApproval = existingMAG.Spec.ManualApproval
+			tc.Spec.ManualApproval.Disabled = ptr.Bool(false)
+			if _, err := r.operatorClientSet.OperatorV1alpha1().TektonConfigs().Update(ctx, tc, metav1.UpdateOptions{}); err != nil {
+				logger.Errorw("Failed to adopt standalone MAG into TektonConfig", "error", err)
+				return v1alpha1.REQUEUE_EVENT_AFTER
+			}
+			return v1alpha1.REQUEUE_EVENT_AFTER
+		}
+	}
+	if !tc.Spec.ManualApproval.IsDisabled() {
+		magCR := manualapprovalgate.GetManualApprovalGateCR(tc, r.operatorVersion)
+		if platformData := r.extension.GetPlatformData(); platformData != "" {
+			if magCR.Annotations == nil {
+				magCR.Annotations = map[string]string{}
+			}
+			magCR.Annotations[v1alpha1.PlatformDataHashKey] = platformData
+		}
+		logger.Debug("Ensuring ManualApprovalGate CR exists")
+		if _, err := manualapprovalgate.EnsureManualApprovalGateExists(ctx, r.operatorClientSet.OperatorV1alpha1().ManualApprovalGates(), magCR); err != nil {
+			errMsg := fmt.Sprintf("ManualApprovalGate: %s", err.Error())
+			logger.Errorw("Failed to ensure ManualApprovalGate exists", "error", err)
+			tc.Status.MarkComponentNotReady(errMsg)
+			return v1alpha1.REQUEUE_EVENT_AFTER
+		}
+		logger.Debug("ManualApprovalGate CR reconciled successfully")
+	} else {
+		logger.Debugw("Ensuring ManualApprovalGate CR doesn't exist", "manualApprovalDisabled", tc.Spec.ManualApproval.IsDisabled())
+		if err := manualapprovalgate.EnsureManualApprovalGateCRNotExists(ctx, r.operatorClientSet.OperatorV1alpha1().ManualApprovalGates()); err != nil {
+			errMsg := fmt.Sprintf("ManualApprovalGate: %s", err.Error())
+			logger.Errorw("Failed to ensure ManualApprovalGate has been deleted", "error", err)
+			tc.Status.MarkComponentNotReady(errMsg)
+			return v1alpha1.REQUEUE_EVENT_AFTER
+		}
+		logger.Debug("ManualApprovalGate CR removal reconciled successfully")
+	}
+
 	// Ensure Result CR
-	if !tc.Spec.Result.Disabled {
+	if !tc.Spec.Result.Disabled && (tc.Spec.Profile == v1alpha1.ProfileAll || tc.Spec.Profile == v1alpha1.ProfileBasic) {
 		tektonresult := result.GetTektonResultCR(tc, r.operatorVersion)
 		if platformData := r.extension.GetPlatformData(); platformData != "" {
 			if tektonresult.Annotations == nil {
@@ -338,7 +407,7 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tc *v1alpha1.TektonConfi
 		}
 		logger.Debug("TektonResult CR reconciled successfully")
 	} else {
-		logger.Debugw("Ensuring TektonResult CR doesn't exist", "resultDisabled", tc.Spec.Result.Disabled)
+		logger.Debugw("Ensuring TektonResult CR doesn't exist", "profile", tc.Spec.Profile, "resultDisabled", tc.Spec.Result.Disabled)
 		if err := result.EnsureTektonResultCRNotExists(ctx, r.operatorClientSet.OperatorV1alpha1().TektonResults()); err != nil {
 			errMsg := fmt.Sprintf("TektonResult: %s", err.Error())
 			logger.Errorw("Failed to ensure TektonResult has been deleted", "error", err)
@@ -348,12 +417,12 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tc *v1alpha1.TektonConfi
 		logger.Debug("TektonResult CR removal reconciled successfully")
 	}
 
-	// Ensure SyncerService CR (conditional based on scheduler multi-cluster config)
+	// Ensure SyncerService CR (conditional based on kueue multi-cluster config)
 	// Syncer-service is deployed only when:
-	// - Scheduler is enabled (not disabled)
+	// - Kueue is enabled (not disabled)
 	// - multi-cluster-disabled: false
 	// - multi-cluster-role: Hub
-	if syncerservice.IsSyncerServiceEnabled(&tc.Spec.Scheduler) {
+	if syncerservice.IsSyncerServiceEnabled(&tc.Spec.Kueue) {
 		syncerServiceCR := syncerservice.GetSyncerServiceCR(tc, r.operatorVersion)
 		logger.Debug("Ensuring SyncerService CR exists (multi-cluster enabled with Hub role)")
 		if _, err := syncerservice.EnsureSyncerServiceExists(ctx, r.operatorClientSet.OperatorV1alpha1().SyncerServices(), syncerServiceCR); err != nil {
@@ -365,9 +434,9 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tc *v1alpha1.TektonConfi
 		logger.Debug("SyncerService CR reconciled successfully")
 	} else {
 		logger.Debugw("Ensuring SyncerService CR doesn't exist",
-			"schedulerDisabled", tc.Spec.Scheduler.IsDisabled(),
-			"multiClusterDisabled", tc.Spec.Scheduler.MultiClusterDisabled,
-			"multiClusterRole", tc.Spec.Scheduler.MultiClusterRole)
+			"kueueDisabled", tc.Spec.Kueue.IsDisabled(),
+			"multiClusterDisabled", tc.Spec.Kueue.MultiClusterDisabled,
+			"multiClusterRole", tc.Spec.Kueue.MultiClusterRole)
 		if err := syncerservice.EnsureSyncerServiceCRNotExists(ctx, r.operatorClientSet.OperatorV1alpha1().SyncerServices()); err != nil {
 			errMsg := fmt.Sprintf("SyncerService: %s", err.Error())
 			logger.Errorw("Failed to ensure SyncerService has been deleted", "error", err)
@@ -402,6 +471,10 @@ func (r *Reconciler) ReconcileKind(ctx context.Context, tc *v1alpha1.TektonConfi
 
 	// Post-reconcile extension hooks
 	if err := r.extension.PostReconcile(ctx, tc); err != nil {
+		if err == v1alpha1.REQUEUE_EVENT_AFTER {
+			logger.Infow("Post-reconcile hook requested requeue", "error", err)
+			return err
+		}
 		logger.Errorw("Post-reconcile hook failed", "error", err)
 		return err
 	}
@@ -454,6 +527,6 @@ func (r *Reconciler) markUpgrade(ctx context.Context, tc *v1alpha1.TektonConfig)
 	return v1alpha1.RECONCILE_AGAIN_ERR
 }
 
-func (r *Reconciler) EnsureSchedulerComponent(ctx context.Context, tc *v1alpha1.TektonConfig) error {
-	return scheduler.EnsureTektonComponent(ctx, tc, r.operatorClientSet, r.operatorVersion)
+func (r *Reconciler) EnsureKueueComponent(ctx context.Context, tc *v1alpha1.TektonConfig) error {
+	return kueue.EnsureTektonComponent(ctx, tc, r.operatorClientSet, r.operatorVersion)
 }

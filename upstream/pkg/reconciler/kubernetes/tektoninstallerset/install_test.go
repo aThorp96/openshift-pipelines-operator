@@ -163,6 +163,7 @@ var (
 		Spec: appsv1.StatefulSetSpec{
 			Replicas:    ptr.Int32(1),
 			ServiceName: "test",
+			Template:    statefulsetPodTemplate,
 		},
 		Status: appsv1.StatefulSetStatus{
 			Replicas:      1,
@@ -181,10 +182,22 @@ var (
 		Spec: appsv1.StatefulSetSpec{
 			Replicas:    ptr.Int32(1),
 			ServiceName: "test",
+			Template:    statefulsetPodTemplate,
 		},
 		Status: appsv1.StatefulSetStatus{
 			Replicas:      1,
 			ReadyReplicas: 1,
+		},
+	}
+	// statefulsetPodTemplate gives the StatefulSet fixtures above a real container
+	// so that spec.template.spec.containers isn't a JSON null, matching what a
+	// real manifest looks like once ApplyProxySettings processes it.
+	statefulsetPodTemplate = corev1.PodTemplateSpec{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:  "test",
+				Image: "test",
+			}},
 		},
 	}
 	readyControllerDeployment = &appsv1.Deployment{
@@ -924,4 +937,89 @@ func getHPA(name, namespace string, desiredReplicas int32, targetKind, targetNam
 			Conditions:      []autoscalingv2.HorizontalPodAutoscalerCondition{},
 		},
 	}
+}
+
+func TestEnsureResources_DropsHubCatalogTypeOnApply(t *testing.T) {
+	desired := pipelinesAsCodeConfigMap(t, map[string]string{
+		"hub-url":          "https://artifacthub.io",
+		"application-name": "Pipelines as Code CI",
+		"hub-catalog-type": "artifacthub",
+	}, nil)
+	live := pipelinesAsCodeConfigMap(t, map[string]string{
+		"hub-url":          "https://artifacthub.io",
+		"hub-catalog-type": "artifacthub",
+		"keep-me":          "yes",
+	}, map[string]string{
+		v1alpha1.LastAppliedHashKey:        "stale",
+		corev1.LastAppliedConfigAnnotation: `{"apiVersion":"v1","kind":"ConfigMap","data":{"hub-url":"https://artifacthub.io"}}`,
+	})
+
+	assertHubCatalogTypeRemoved(t, desired, live)
+	got := configMapData(t, live)
+	assert.Equal(t, got["keep-me"], "yes")
+	assert.Equal(t, got["application-name"], "Pipelines as Code CI")
+	assert.Equal(t, got["hub-url"], "https://artifacthub.io")
+}
+
+func TestEnsureResources_DropsHubCatalogTypeWhenHashMatches(t *testing.T) {
+	desired := pipelinesAsCodeConfigMap(t, map[string]string{
+		"hub-url": "https://artifacthub.io",
+	}, nil)
+	sum, err := hash.Compute(desired.Object)
+	assert.NilError(t, err)
+	live := pipelinesAsCodeConfigMap(t, map[string]string{
+		"hub-url":          "https://artifacthub.io",
+		"hub-catalog-type": "artifacthub",
+		"keep-me":          "yes",
+	}, map[string]string{
+		v1alpha1.LastAppliedHashKey:        sum,
+		corev1.LastAppliedConfigAnnotation: `{"apiVersion":"v1","kind":"ConfigMap","data":{"hub-url":"https://artifacthub.io"}}`,
+	})
+
+	assertHubCatalogTypeRemoved(t, desired, live)
+	assert.Equal(t, configMapData(t, live)["keep-me"], "yes")
+}
+
+func assertHubCatalogTypeRemoved(t *testing.T, desired, live *unstructured.Unstructured) {
+	t.Helper()
+	fakeClient := fake.New(live)
+	logger := zap.NewNop().Sugar()
+	manifest, err := mf.ManifestFrom(mf.Slice([]unstructured.Unstructured{*desired}))
+	assert.NilError(t, err)
+	installer := NewInstaller(&manifest, fakeClient, k8sfake.NewSimpleClientset(), logger)
+	assert.NilError(t, installer.EnsureNamespaceScopedResources("test-installerset"))
+
+	got, err := fakeClient.Get(desired)
+	assert.NilError(t, err)
+	_, exists := configMapData(t, got)["hub-catalog-type"]
+	assert.Equal(t, exists, false)
+	*live = *got
+}
+
+func pipelinesAsCodeConfigMap(t *testing.T, data, annotations map[string]string) *unstructured.Unstructured {
+	t.Helper()
+	cm := &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "pipelines-as-code",
+			Namespace:   "openshift-pipelines",
+			Annotations: annotations,
+		},
+		Data: data,
+	}
+	obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(cm)
+	assert.NilError(t, err)
+	u := &unstructured.Unstructured{Object: obj}
+	u.SetAPIVersion("v1")
+	u.SetKind("ConfigMap")
+	u.SetName(cm.Name)
+	u.SetNamespace(cm.Namespace)
+	return u
+}
+
+func configMapData(t *testing.T, obj *unstructured.Unstructured) map[string]string {
+	t.Helper()
+	data, _, err := unstructured.NestedStringMap(obj.Object, "data")
+	assert.NilError(t, err)
+	return data
 }

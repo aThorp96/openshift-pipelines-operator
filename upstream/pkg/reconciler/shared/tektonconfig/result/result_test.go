@@ -18,14 +18,15 @@ package result
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/tektoncd/operator/pkg/apis/operator/v1alpha1"
 	op "github.com/tektoncd/operator/pkg/client/clientset/versioned/typed/operator/v1alpha1"
 	"github.com/tektoncd/operator/pkg/client/injection/client/fake"
 	util "github.com/tektoncd/operator/pkg/reconciler/common/testing"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"knative.dev/pkg/ptr"
 	ts "knative.dev/pkg/reconciler/testing"
 )
 
@@ -140,48 +141,26 @@ func getTektonConfig() *v1alpha1.TektonConfig {
 	}
 }
 
-func TestGetTektonResultCR_HubClusterConfig(t *testing.T) {
+func TestGetTektonResultCR_CompleteInstallBothRoles(t *testing.T) {
 	tests := []struct {
-		name                       string
-		multiClusterDisabled       bool
-		multiClusterRole           v1alpha1.MultiClusterRole
-		expectZeroReplicaWatcher   bool
-		expectZeroReplicaRetention bool
+		name                 string
+		multiClusterDisabled bool
+		multiClusterRole     v1alpha1.MultiClusterRole
 	}{
 		{
-			name:                       "multicluster enabled with Hub role - should set zero replicas",
-			multiClusterDisabled:       false,
-			multiClusterRole:           v1alpha1.MultiClusterRoleHub,
-			expectZeroReplicaWatcher:   true,
-			expectZeroReplicaRetention: true,
+			name:                 "multicluster enabled with Hub role - complete install",
+			multiClusterDisabled: false,
+			multiClusterRole:     v1alpha1.MultiClusterRoleHub,
 		},
 		{
-			name:                       "multicluster enabled with Spoke role - should NOT set zero replicas",
-			multiClusterDisabled:       false,
-			multiClusterRole:           v1alpha1.MultiClusterRoleSpoke,
-			expectZeroReplicaWatcher:   false,
-			expectZeroReplicaRetention: false,
+			name:                 "multicluster enabled with Spoke role - complete install",
+			multiClusterDisabled: false,
+			multiClusterRole:     v1alpha1.MultiClusterRoleSpoke,
 		},
 		{
-			name:                       "multicluster disabled with Hub role - should NOT set zero replicas",
-			multiClusterDisabled:       true,
-			multiClusterRole:           v1alpha1.MultiClusterRoleHub,
-			expectZeroReplicaWatcher:   false,
-			expectZeroReplicaRetention: false,
-		},
-		{
-			name:                       "multicluster disabled with Spoke role - should NOT set zero replicas",
-			multiClusterDisabled:       true,
-			multiClusterRole:           v1alpha1.MultiClusterRoleSpoke,
-			expectZeroReplicaWatcher:   false,
-			expectZeroReplicaRetention: false,
-		},
-		{
-			name:                       "multicluster disabled with empty role - should NOT set zero replicas",
-			multiClusterDisabled:       true,
-			multiClusterRole:           "",
-			expectZeroReplicaWatcher:   false,
-			expectZeroReplicaRetention: false,
+			name:                 "multicluster disabled - complete install",
+			multiClusterDisabled: true,
+			multiClusterRole:     "",
 		},
 	}
 
@@ -196,7 +175,7 @@ func TestGetTektonResultCR_HubClusterConfig(t *testing.T) {
 					CommonSpec: v1alpha1.CommonSpec{
 						TargetNamespace: "tekton-pipelines",
 					},
-					Scheduler: v1alpha1.Scheduler{
+					Kueue: v1alpha1.Kueue{
 						MultiClusterConfig: v1alpha1.MultiClusterConfig{
 							MultiClusterDisabled: tt.multiClusterDisabled,
 							MultiClusterRole:     tt.multiClusterRole,
@@ -207,34 +186,70 @@ func TestGetTektonResultCR_HubClusterConfig(t *testing.T) {
 
 			result := GetTektonResultCR(config, "v0.70.0")
 
-			// Check watcher deployment replicas
-			watcherDeployment, watcherExists := result.Spec.Options.Deployments["tekton-results-watcher"]
-			if tt.expectZeroReplicaWatcher {
-				if !watcherExists {
-					t.Error("expected watcher deployment to exist in Options.Deployments")
-				} else if watcherDeployment.Spec.Replicas == nil || *watcherDeployment.Spec.Replicas != 0 {
-					t.Errorf("expected watcher replicas to be 0, got %v", watcherDeployment.Spec.Replicas)
-				}
-			} else {
-				if watcherExists && watcherDeployment.Spec.Replicas != nil && *watcherDeployment.Spec.Replicas == 0 {
-					t.Error("did not expect watcher replicas to be set to 0")
+			// Complete install: no forced zero replicas for watcher or retention-policy-agent
+			if watcherDeployment, exists := result.Spec.Options.Deployments["tekton-results-watcher"]; exists {
+				if watcherDeployment.Spec.Replicas != nil && *watcherDeployment.Spec.Replicas == 0 {
+					t.Error("did not expect watcher replicas to be forced to 0")
 				}
 			}
-
-			// Check retention-policy-agent deployment replicas
-			retentionDeployment, retentionExists := result.Spec.Options.Deployments["tekton-results-retention-policy-agent"]
-			if tt.expectZeroReplicaRetention {
-				if !retentionExists {
-					t.Error("expected retention-policy-agent deployment to exist in Options.Deployments")
-				} else if retentionDeployment.Spec.Replicas == nil || *retentionDeployment.Spec.Replicas != 0 {
-					t.Errorf("expected retention-policy-agent replicas to be 0, got %v", retentionDeployment.Spec.Replicas)
-				}
-			} else {
-				if retentionExists && retentionDeployment.Spec.Replicas != nil && *retentionDeployment.Spec.Replicas == 0 {
-					t.Error("did not expect retention-policy-agent replicas to be set to 0")
+			if retentionDeployment, exists := result.Spec.Options.Deployments["tekton-results-retention-policy-agent"]; exists {
+				if retentionDeployment.Spec.Replicas != nil && *retentionDeployment.Spec.Replicas == 0 {
+					t.Error("did not expect retention-policy-agent replicas to be forced to 0")
 				}
 			}
 		})
+	}
+}
+
+func TestUpdateResult_WatcherPropagation(t *testing.T) {
+	ctx, _ := ts.SetupFakeContext(t)
+	clients := fake.Get(ctx).OperatorV1alpha1().TektonResults()
+
+	checkOwner := true
+	old := &v1alpha1.TektonResult{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: v1alpha1.ResultResourceName,
+			Labels: map[string]string{
+				v1alpha1.ReleaseVersionKey: "v0.70.0",
+			},
+		},
+		Spec: v1alpha1.TektonResultSpec{
+			CommonSpec: v1alpha1.CommonSpec{TargetNamespace: "tekton-pipelines"},
+			Result: v1alpha1.Result{
+				Watcher: v1alpha1.ResultsWatcherProperties{
+					CheckOwner: &checkOwner,
+				},
+			},
+		},
+	}
+	_, err := clients.Create(ctx, old, metav1.CreateOptions{})
+	util.AssertNoError(t, err)
+
+	gracePeriod := metav1.Duration{Duration: 24 * time.Hour}
+	newCheckOwner := false
+	updated := old.DeepCopy()
+	updated.Spec.Watcher = v1alpha1.ResultsWatcherProperties{
+		CompletedRunGracePeriod: &gracePeriod,
+		CheckOwner:              &newCheckOwner,
+		SummaryLabels:           ptr.String("tekton.dev/pipeline"),
+	}
+
+	_, err = UpdateResult(ctx, old, updated, clients)
+	// UpdateResult returns RECONCILE_AGAIN_ERR after a successful update.
+	if err != v1alpha1.RECONCILE_AGAIN_ERR {
+		t.Fatalf("expected RECONCILE_AGAIN_ERR after watcher update, got %v", err)
+	}
+
+	got, err := clients.Get(ctx, v1alpha1.ResultResourceName, metav1.GetOptions{})
+	util.AssertNoError(t, err)
+	if got.Spec.Watcher.CheckOwner == nil || *got.Spec.Watcher.CheckOwner != false {
+		t.Errorf("expected CheckOwner=false after update, got %v", got.Spec.Watcher.CheckOwner)
+	}
+	if got.Spec.Watcher.CompletedRunGracePeriod == nil || got.Spec.Watcher.CompletedRunGracePeriod.Duration != 24*time.Hour {
+		t.Errorf("expected CompletedRunGracePeriod=24h after update, got %v", got.Spec.Watcher.CompletedRunGracePeriod)
+	}
+	if got.Spec.Watcher.SummaryLabels == nil || *got.Spec.Watcher.SummaryLabels != "tekton.dev/pipeline" {
+		t.Errorf("expected SummaryLabels to be updated, got %v", got.Spec.Watcher.SummaryLabels)
 	}
 }
 
@@ -279,67 +294,67 @@ func TestGetTektonResultCR_ConfigPropagation(t *testing.T) {
 	}
 }
 
-func TestDisableWatcherAndRetentionAgentOnHubCluster(t *testing.T) {
-	t.Run("injects zero replicas for watcher and retention-policy-agent", func(t *testing.T) {
-		result := v1alpha1.Result{}
-		modifiedResult := disableWatcherAndRetentionAgentOnHubCluster(result)
-
-		// Verify Deployments map is initialized
-		if modifiedResult.Options.Deployments == nil {
-			t.Fatal("expected Deployments map to be initialized")
-		}
-
-		// Verify watcher deployment
-		watcherDeployment, exists := modifiedResult.Options.Deployments["tekton-results-watcher"]
-		if !exists {
-			t.Error("expected tekton-results-watcher deployment to exist")
-		}
-		if watcherDeployment.Spec.Replicas == nil || *watcherDeployment.Spec.Replicas != 0 {
-			t.Errorf("expected watcher replicas to be 0, got %v", watcherDeployment.Spec.Replicas)
-		}
-
-		// Verify retention-policy-agent deployment
-		retentionDeployment, exists := modifiedResult.Options.Deployments["tekton-results-retention-policy-agent"]
-		if !exists {
-			t.Error("expected tekton-results-retention-policy-agent deployment to exist")
-		}
-		if retentionDeployment.Spec.Replicas == nil || *retentionDeployment.Spec.Replicas != 0 {
-			t.Errorf("expected retention-policy-agent replicas to be 0, got %v", retentionDeployment.Spec.Replicas)
-		}
-	})
-
-	t.Run("preserves existing deployment configurations", func(t *testing.T) {
-		// Create a result with existing deployment config
-		existingReplicas := int32(3)
-		result := v1alpha1.Result{
-			Options: v1alpha1.AdditionalOptions{
-				Deployments: map[string]appsv1.Deployment{
-					"tekton-results-watcher": {
-						Spec: appsv1.DeploymentSpec{
-							Replicas: &existingReplicas,
-						},
-					},
-					"tekton-results-api": {
-						Spec: appsv1.DeploymentSpec{
-							Replicas: &existingReplicas,
-						},
+func TestGetTektonResultCR_PropagatesResultsAPIFields(t *testing.T) {
+	idle := int64(20)
+	open := int64(40)
+	profiling := true
+	qps := float32(25)
+	burst := 40
+	config := &v1alpha1.TektonConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: v1alpha1.ConfigResourceName,
+		},
+		Spec: v1alpha1.TektonConfigSpec{
+			Profile: v1alpha1.ProfileAll,
+			CommonSpec: v1alpha1.CommonSpec{
+				TargetNamespace: "tekton-pipelines",
+			},
+			Result: v1alpha1.Result{
+				ResultsAPIProperties: v1alpha1.ResultsAPIProperties{
+					DBMaxIdleConnections:    &idle,
+					DBMaxOpenConnections:    &open,
+					SQLLogLevel:             "info",
+					FeatureGates:            "PartialResponse=true",
+					Profiling:               &profiling,
+					LoggingPluginJSONMap:    `{"timestamp":"@timestamp"}`,
+					LoggingPluginLineFormat: "{{.timestamp}}: {{.message}}",
+				},
+				Performance: v1alpha1.PerformanceProperties{
+					DeploymentPerformanceArgs: v1alpha1.DeploymentPerformanceArgs{
+						KubeApiQPS:   &qps,
+						KubeApiBurst: &burst,
 					},
 				},
 			},
-		}
+		},
+	}
 
-		modifiedResult := disableWatcherAndRetentionAgentOnHubCluster(result)
-
-		// Verify watcher replicas is now 0 (overwritten)
-		watcherDeployment := modifiedResult.Options.Deployments["tekton-results-watcher"]
-		if watcherDeployment.Spec.Replicas == nil || *watcherDeployment.Spec.Replicas != 0 {
-			t.Errorf("expected watcher replicas to be 0, got %v", watcherDeployment.Spec.Replicas)
-		}
-
-		// Verify api deployment is unchanged
-		apiDeployment := modifiedResult.Options.Deployments["tekton-results-api"]
-		if apiDeployment.Spec.Replicas == nil || *apiDeployment.Spec.Replicas != existingReplicas {
-			t.Errorf("expected api replicas to remain %d, got %v", existingReplicas, apiDeployment.Spec.Replicas)
-		}
-	})
+	result := GetTektonResultCR(config, "v0.70.0")
+	if result.Spec.DBMaxIdleConnections == nil || *result.Spec.DBMaxIdleConnections != 20 {
+		t.Fatalf("db_max_idle_connections was not copied, got %v", result.Spec.DBMaxIdleConnections)
+	}
+	if result.Spec.DBMaxOpenConnections == nil || *result.Spec.DBMaxOpenConnections != 40 {
+		t.Fatalf("db_max_open_connections was not copied, got %v", result.Spec.DBMaxOpenConnections)
+	}
+	if result.Spec.SQLLogLevel != "info" {
+		t.Fatalf("sql_log_level was not copied, got %q", result.Spec.SQLLogLevel)
+	}
+	if result.Spec.FeatureGates != "PartialResponse=true" {
+		t.Fatalf("feature_gates was not copied, got %q", result.Spec.FeatureGates)
+	}
+	if result.Spec.Profiling == nil || !*result.Spec.Profiling {
+		t.Fatalf("profiling was not copied, got %v", result.Spec.Profiling)
+	}
+	if result.Spec.LoggingPluginJSONMap != `{"timestamp":"@timestamp"}` {
+		t.Fatalf("logging_plugin_json_map was not copied, got %q", result.Spec.LoggingPluginJSONMap)
+	}
+	if result.Spec.LoggingPluginLineFormat != "{{.timestamp}}: {{.message}}" {
+		t.Fatalf("logging_plugin_line_format was not copied, got %q", result.Spec.LoggingPluginLineFormat)
+	}
+	if result.Spec.Performance.KubeApiQPS == nil || *result.Spec.Performance.KubeApiQPS != 25 {
+		t.Fatalf("kube-api-qps was not copied, got %v", result.Spec.Performance.KubeApiQPS)
+	}
+	if result.Spec.Performance.KubeApiBurst == nil || *result.Spec.Performance.KubeApiBurst != 40 {
+		t.Fatalf("kube-api-burst was not copied, got %v", result.Spec.Performance.KubeApiBurst)
+	}
 }

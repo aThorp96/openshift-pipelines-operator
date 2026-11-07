@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"testing"
 
-	configv1 "github.com/openshift/api/config/v1"
 	"github.com/tektoncd/operator/pkg/apis/operator/v1alpha1"
 )
 
@@ -56,97 +55,6 @@ func TestConvertTLSVersionToEnvFormat(t *testing.T) {
 	}
 }
 
-func TestSupplementTLS13Ciphers(t *testing.T) {
-	tests := []struct {
-		name            string
-		profile         *configv1.TLSSecurityProfile
-		observedCiphers []string
-		expectContains  []string
-	}{
-		{
-			name:            "Nil profile returns observed ciphers unchanged",
-			profile:         nil,
-			observedCiphers: []string{"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"},
-			expectContains:  []string{"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"},
-		},
-		{
-			name: "Custom profile with TLS 1.3 ciphers supplements missing ones",
-			profile: &configv1.TLSSecurityProfile{
-				Type: configv1.TLSProfileCustomType,
-				Custom: &configv1.CustomTLSProfile{
-					TLSProfileSpec: configv1.TLSProfileSpec{
-						Ciphers: []string{
-							"TLS_AES_128_GCM_SHA256",
-							"TLS_AES_256_GCM_SHA384",
-						},
-					},
-				},
-			},
-			observedCiphers: []string{},
-			expectContains:  []string{"TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384"},
-		},
-		{
-			name: "Mixed ciphers - TLS 1.3 supplemented, TLS 1.2 kept",
-			profile: &configv1.TLSSecurityProfile{
-				Type: configv1.TLSProfileCustomType,
-				Custom: &configv1.CustomTLSProfile{
-					TLSProfileSpec: configv1.TLSProfileSpec{
-						Ciphers: []string{
-							"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-							"TLS_AES_128_GCM_SHA256",
-						},
-					},
-				},
-			},
-			observedCiphers: []string{"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"},
-			expectContains:  []string{"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "TLS_AES_128_GCM_SHA256"},
-		},
-		{
-			name: "Already present TLS 1.3 ciphers not duplicated",
-			profile: &configv1.TLSSecurityProfile{
-				Type: configv1.TLSProfileCustomType,
-				Custom: &configv1.CustomTLSProfile{
-					TLSProfileSpec: configv1.TLSProfileSpec{
-						Ciphers: []string{
-							"TLS_AES_128_GCM_SHA256",
-						},
-					},
-				},
-			},
-			observedCiphers: []string{"TLS_AES_128_GCM_SHA256"},
-			expectContains:  []string{"TLS_AES_128_GCM_SHA256"},
-		},
-		{
-			name: "Modern profile type uses predefined profile spec",
-			profile: &configv1.TLSSecurityProfile{
-				Type: configv1.TLSProfileModernType,
-			},
-			observedCiphers: []string{},
-			// Modern profile includes TLS 1.3 ciphers in predefined spec
-			expectContains: []string{},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := supplementTLS13Ciphers(tt.profile, tt.observedCiphers)
-
-			for _, expected := range tt.expectContains {
-				found := false
-				for _, cipher := range result {
-					if cipher == expected {
-						found = true
-						break
-					}
-				}
-				if !found {
-					t.Errorf("Expected cipher %s not found in result %v", expected, result)
-				}
-			}
-		})
-	}
-}
-
 func TestTLSEnvVarsFromProfile(t *testing.T) {
 	t.Run("nil config returns nil", func(t *testing.T) {
 		result, err := TLSEnvVarsFromProfile(nil)
@@ -160,8 +68,9 @@ func TestTLSEnvVarsFromProfile(t *testing.T) {
 
 	t.Run("valid TLS 1.2 profile", func(t *testing.T) {
 		cfg := &TLSProfileConfig{
-			MinTLSVersion: "VersionTLS12",
-			CipherSuites:  []string{"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "TLS_AES_128_GCM_SHA256"},
+			MinTLSVersion:    "VersionTLS12",
+			CipherSuites:     []string{"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "TLS_AES_128_GCM_SHA256"},
+			CurvePreferences: []string{"X25519MLKEM768", "X25519", "secp256r1"},
 		}
 		result, err := TLSEnvVarsFromProfile(cfg)
 		if err != nil {
@@ -172,6 +81,37 @@ func TestTLSEnvVarsFromProfile(t *testing.T) {
 		}
 		if result.CipherSuites != "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_AES_128_GCM_SHA256" {
 			t.Errorf("CipherSuites = %s, want TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_AES_128_GCM_SHA256", result.CipherSuites)
+		}
+		if result.CurvePreferences != "X25519MLKEM768,X25519,P-256" {
+			t.Errorf("CurvePreferences = %s, want X25519MLKEM768,X25519,P-256", result.CurvePreferences)
+		}
+	})
+
+	t.Run("drops API groups unknown to knative", func(t *testing.T) {
+		cfg := &TLSProfileConfig{
+			MinTLSVersion:    "VersionTLS12",
+			CurvePreferences: []string{"X25519", "SecP256r1MLKEM768", "secp384r1"},
+		}
+		result, err := TLSEnvVarsFromProfile(cfg)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if result.CurvePreferences != "X25519,P-384" {
+			t.Errorf("CurvePreferences = %s, want X25519,P-384", result.CurvePreferences)
+		}
+	})
+
+	t.Run("normalizes Knative aliases via curvesByName-style map", func(t *testing.T) {
+		cfg := &TLSProfileConfig{
+			MinTLSVersion:    "VersionTLS12",
+			CurvePreferences: []string{"CurveP256", "P-384", "X25519"},
+		}
+		result, err := TLSEnvVarsFromProfile(cfg)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if result.CurvePreferences != "P-256,P-384,X25519" {
+			t.Errorf("CurvePreferences = %s, want P-256,P-384,X25519", result.CurvePreferences)
 		}
 	})
 
@@ -241,6 +181,7 @@ func TestResolveCentralTLSToEnvVars_TektonConfigNotFound(t *testing.T) {
 func TestResolveCentralTLSToEnvVars_NilTreatedAsEnabled(t *testing.T) {
 	// nil means the field was never set → default-on behaviour; should NOT return nil early.
 	tc := &v1alpha1.TektonConfig{}
+	tc.Spec.Platforms.OpenShift = &v1alpha1.OpenShift{}
 	tc.Spec.Platforms.OpenShift.EnableCentralTLSConfig = nil
 	lister := &fakeTektonConfigLister{tc: tc}
 
@@ -258,6 +199,7 @@ func TestResolveCentralTLSToEnvVars_NilTreatedAsEnabled(t *testing.T) {
 func TestResolveCentralTLSToEnvVars_Disabled(t *testing.T) {
 	tc := &v1alpha1.TektonConfig{}
 	disabled := false
+	tc.Spec.Platforms.OpenShift = &v1alpha1.OpenShift{}
 	tc.Spec.Platforms.OpenShift.EnableCentralTLSConfig = &disabled
 	lister := &fakeTektonConfigLister{tc: tc}
 	result, err := ResolveCentralTLSToEnvVars(context.Background(), lister)
@@ -272,6 +214,7 @@ func TestResolveCentralTLSToEnvVars_Disabled(t *testing.T) {
 func TestResolveCentralTLSToEnvVars_EnabledButNoLister(t *testing.T) {
 	tc := &v1alpha1.TektonConfig{}
 	enabled := true
+	tc.Spec.Platforms.OpenShift = &v1alpha1.OpenShift{}
 	tc.Spec.Platforms.OpenShift.EnableCentralTLSConfig = &enabled
 	lister := &fakeTektonConfigLister{tc: tc}
 
