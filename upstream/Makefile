@@ -25,7 +25,7 @@ export GOTOOLCHAIN=auto
 
 $(BIN):
 	@mkdir -p $@
-$(BIN)/%: | $(BIN) ; $(info $(M) building $(PACKAGE)…)
+$(BIN)/%: | $(BIN) ; $(info $(M) building $(PACKAGE))
 	$Q tmp=$$(mktemp -d); cd $$tmp; \
 		env GO111MODULE=on GOPATH=$$tmp GOBIN=$(BIN) $(GO) install $(PACKAGE) \
 		|| ret=$$?; \
@@ -51,12 +51,12 @@ $(BIN)/golangci-lint: | $(BIN) ; $(info $(M) getting golangci-lint $(GOLANGCI_VE
 	@if [ -f $(BIN)/golangci-lint ] && $(BIN)/golangci-lint --version 2>/dev/null | grep -qF "$(GOLANGCI_VERSION)"; then \
 		echo "golangci-lint $(GOLANGCI_VERSION) already installed"; \
 	else \
-		curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(BIN) $(GOLANGCI_VERSION); \
+		curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/main/install.sh | sh -s -- -b $(BIN) $(GOLANGCI_VERSION); \
 	fi
 
 ##@ Clean 
 .PHONY: clean-cluster
-clean-cluster: | $(KO) $(KUSTOMIZE) clean-cr; $(info $(M) clean $(TARGET)…) @ ## Cleanup cluster
+clean-cluster: | $(KO) $(KUSTOMIZE) clean-cr; $(info $(M) clean $(TARGET)) @ ## Cleanup cluster
 	@ ## --load-restrictor LoadRestrictionsNone is needed in kustomize build as files which not in child tree of kustomize base are pulled
 	@ ## https://github.com/kubernetes-sigs/kustomize/issues/766
 	-$(KUSTOMIZE) build --load-restrictor LoadRestrictionsNone config/$(TARGET)/overlays/default | $(KO) delete -f -
@@ -72,7 +72,6 @@ ifeq ($(TARGET), openshift)
 	rm -rf ./cmd/$(TARGET)/operator/kodata/tekton-pipeline
 	rm -rf ./cmd/$(TARGET)/operator/kodata/tekton-trigger
 	rm -rf ./cmd/$(TARGET)/operator/kodata/tekton-chains
-	rm -rf ./cmd/$(TARGET)/operator/kodata/tekton-hub
 	rm -rf ./cmd/$(TARGET)/operator/kodata/tekton-results
 	rm -rf ./cmd/$(TARGET)/operator/kodata/manual-approval-gate
 	rm -rf ./cmd/$(TARGET)/operator/kodata/tekton-pruner
@@ -127,11 +126,11 @@ generated: | vendor ; $(info $(M) update generated files) ## Update generated fi
 
 ##@ CRD Generation
 .PHONY: generate-crds
-generate-crds: | $(CONTROLLER_GEN) ; $(info $(M) generating CRDs from Go types…) ## Generate CRD manifests from Go types
+generate-crds: | $(CONTROLLER_GEN) ; $(info $(M) generating CRDs from Go types) ## Generate CRD manifests from Go types
 	$Q $(CONTROLLER_GEN) crd:allowDangerousTypes=true paths="./pkg/apis/operator/v1alpha1/..." output:crd:artifacts:config=config/base/generated-crds
 
 .PHONY: sync-helm-crds
-sync-helm-crds: generate-crds ; $(info $(M) syncing CRDs to config and Helm chart…) ## Sync generated CRDs to config/ and Helm chart
+sync-helm-crds: generate-crds ; $(info $(M) syncing CRDs to config and Helm chart) ## Sync generated CRDs to config/ and Helm chart
 	$Q ./hack/sync-helm-crds.sh
 
 .PHONY: vendor

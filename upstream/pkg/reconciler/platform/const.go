@@ -22,17 +22,24 @@ const (
 	ControllerTektonPipeline       ControllerName = "tektonpipeline"
 	ControllerTektonTrigger        ControllerName = "tektontrigger"
 	ControllerTektonInstallerSet   ControllerName = "tektoninstallerset"
-	ControllerTektonHub            ControllerName = "tektonhub"
 	ControllerTektonChain          ControllerName = "tektonchain"
 	ControllerTektonResult         ControllerName = "tektonresult"
 	ControllerManualApprovalGate   ControllerName = "manualapprovalgate"
 	ControllerTektonPruner         ControllerName = "tektonpruner"
-	ControllerTektonScheduler      ControllerName = "tektonscheduler"
+	ControllerTektonKueue          ControllerName = "tektonkueue"
 	ControllerMulticlusterProxyAAE ControllerName = "tektonmulticlusterproxyaae"
 	ControllerSyncerService        ControllerName = "syncerservice"
+	// ControllerNamespaceSync is the OpenShift-only watch-based controller that
+	// ensures Tekton resources (pipeline SA, CA bundles, RoleBindings, secret
+	// bindings) are present and up to date in every user namespace.
+	ControllerNamespaceSync ControllerName = "namespacesync"
 	// ControllerOpenShiftPipelinesAsCode is the operand reconciler for OpenShiftPipelinesAsCode;
 	// the same name is used on Kubernetes and OpenShift so -controllers flags stay consistent.
 	ControllerOpenShiftPipelinesAsCode ControllerName = "openshiftpipelinesascode"
-	EnvControllerNames                 string         = "CONTROLLER_NAMES"
-	EnvSharedMainName                  string         = "UNIQUE_PROCESS_NAME"
+	// ControllerShipwrightBuild is the operand reconciler for ShipwrightBuild, which runs on both Kubernetes and OpenShift.
+	ControllerShipwrightBuild ControllerName = "shipwrightbuild"
+	// ControllerSharedResource is the operand reconciler for SharedResource (OpenShift-only).
+	ControllerSharedResource ControllerName = "sharedresource"
+	EnvControllerNames       string         = "CONTROLLER_NAMES"
+	EnvSharedMainName        string         = "UNIQUE_PROCESS_NAME"
 )

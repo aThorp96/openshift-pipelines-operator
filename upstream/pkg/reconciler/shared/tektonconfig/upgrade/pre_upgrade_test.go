@@ -23,11 +23,14 @@ import (
 
 	"github.com/tektoncd/operator/pkg/reconciler/kubernetes/tektonpruner"
 	v1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	k8sFake "k8s.io/client-go/kubernetes/fake"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/tektoncd/operator/pkg/apis/operator/v1alpha1"
 	operatorFake "github.com/tektoncd/operator/pkg/client/clientset/versioned/fake"
+	"github.com/tektoncd/tekton-kueue/pkg/config"
+	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	duckv1 "knative.dev/pkg/apis/duck/v1"
 	"knative.dev/pkg/logging"
@@ -68,6 +71,141 @@ func TestResetTektonConfigConditions(t *testing.T) {
 	_tc, err := operatorClient.OperatorV1alpha1().TektonConfigs().Get(ctx, v1alpha1.ConfigResourceName, metav1.GetOptions{})
 	assert.NoError(t, err)
 	assert.Empty(t, _tc.Status.Conditions)
+}
+
+func TestMigrateTektonSchedulerToTektonKueue(t *testing.T) {
+	ctx := context.TODO()
+	k8sClient := k8sFake.NewSimpleClientset(
+		&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: deprecatedTektonSchedulerClusterRole}},
+		&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: deprecatedTektonSchedulerClusterRoleBinding}},
+	)
+	operatorClient := operatorFake.NewSimpleClientset(
+		&v1alpha1.TektonConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: v1alpha1.ConfigResourceName},
+			Spec: v1alpha1.TektonConfigSpec{
+				Scheduler: v1alpha1.Scheduler{
+					Disabled: ptr.Bool(false),
+					SchedulerConfig: v1alpha1.SchedulerConfig{Config: config.Config{
+						QueueName: "migration-test-queue",
+					}},
+					SchedulerMultiClusterConfig: v1alpha1.SchedulerMultiClusterConfig{
+						MultiClusterDisabled: true,
+					},
+				},
+			},
+		},
+		&v1alpha1.TektonScheduler{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       v1alpha1.TektonSchedulerResourceName,
+				Finalizers: []string{deprecatedTektonSchedulerFinalizer, "example.dev/preserve"},
+			},
+			Spec: v1alpha1.TektonSchedulerSpec{
+				CommonSpec: v1alpha1.CommonSpec{TargetNamespace: "tekton-pipelines"},
+				Scheduler: v1alpha1.Scheduler{
+					Disabled: ptr.Bool(false),
+					SchedulerConfig: v1alpha1.SchedulerConfig{Config: config.Config{
+						QueueName: "migration-test-queue",
+					}},
+					SchedulerMultiClusterConfig: v1alpha1.SchedulerMultiClusterConfig{
+						MultiClusterDisabled: true,
+					},
+				},
+				NetworkPolicy: v1alpha1.NetworkPolicyConfig{Disabled: true},
+			},
+		},
+		&v1alpha1.TektonInstallerSet{ObjectMeta: metav1.ObjectMeta{
+			Name: "scheduler-main",
+			Labels: map[string]string{
+				v1alpha1.CreatedByKey: v1alpha1.SchedulerCreatedByValue,
+			},
+		}},
+	)
+	logger := logging.FromContext(ctx).Named("unit-test")
+
+	// The migration advances one durable API operation per scheduled reconciliation.
+	for range 5 {
+		err := migrateTektonSchedulerToTektonKueue(ctx, logger, k8sClient, operatorClient, nil)
+		assert.ErrorIs(t, err, v1alpha1.REQUEUE_EVENT_AFTER)
+	}
+	legacy, err := operatorClient.OperatorV1alpha1().TektonSchedulers().Get(ctx, v1alpha1.TektonSchedulerResourceName, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"example.dev/preserve"}, legacy.Finalizers)
+
+	// Deletion schedules a final reconciliation so pre-upgrade does not complete
+	// while a legacy resource is still terminating on a preserved finalizer.
+	assert.ErrorIs(t, migrateTektonSchedulerToTektonKueue(ctx, logger, k8sClient, operatorClient, nil), v1alpha1.REQUEUE_EVENT_AFTER)
+	assert.NoError(t, migrateTektonSchedulerToTektonKueue(ctx, logger, k8sClient, operatorClient, nil))
+
+	tc, err := operatorClient.OperatorV1alpha1().TektonConfigs().Get(ctx, v1alpha1.ConfigResourceName, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, false, tc.Spec.Kueue.IsDisabled())
+	assert.Equal(t, "migration-test-queue", tc.Spec.Kueue.QueueName)
+	assert.Equal(t, v1alpha1.Scheduler{}, tc.Spec.Scheduler)
+
+	installerSets, err := operatorClient.OperatorV1alpha1().TektonInstallerSets().List(ctx, metav1.ListOptions{})
+	assert.NoError(t, err)
+	assert.Empty(t, installerSets.Items)
+
+	kueue, err := operatorClient.OperatorV1alpha1().TektonKueues().Get(ctx, v1alpha1.TektonKueueResourceName, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, "tekton-pipelines", kueue.Spec.TargetNamespace)
+	assert.Equal(t, false, kueue.Spec.Kueue.IsDisabled())
+	assert.Equal(t, "migration-test-queue", kueue.Spec.Kueue.QueueName)
+	assert.True(t, kueue.Spec.NetworkPolicy.Disabled)
+
+	_, err = operatorClient.OperatorV1alpha1().TektonSchedulers().Get(ctx, v1alpha1.TektonSchedulerResourceName, metav1.GetOptions{})
+	assert.True(t, apierrs.IsNotFound(err))
+	_, err = k8sClient.RbacV1().ClusterRoles().Get(ctx, deprecatedTektonSchedulerClusterRole, metav1.GetOptions{})
+	assert.True(t, apierrs.IsNotFound(err))
+	_, err = k8sClient.RbacV1().ClusterRoleBindings().Get(ctx, deprecatedTektonSchedulerClusterRoleBinding, metav1.GetOptions{})
+	assert.True(t, apierrs.IsNotFound(err))
+}
+
+func TestMigrateTektonSchedulerToTektonKueueDisabled(t *testing.T) {
+	ctx := context.TODO()
+	operatorClient := operatorFake.NewSimpleClientset(&v1alpha1.TektonConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: v1alpha1.ConfigResourceName},
+		Spec: v1alpha1.TektonConfigSpec{Scheduler: v1alpha1.Scheduler{
+			Disabled: ptr.Bool(true),
+		}},
+	})
+	logger := logging.FromContext(ctx).Named("unit-test")
+
+	assert.ErrorIs(t, migrateTektonSchedulerToTektonKueue(ctx, logger, nil, operatorClient, nil), v1alpha1.REQUEUE_EVENT_AFTER)
+	assert.NoError(t, migrateTektonSchedulerToTektonKueue(ctx, logger, nil, operatorClient, nil))
+
+	tc, err := operatorClient.OperatorV1alpha1().TektonConfigs().Get(ctx, v1alpha1.ConfigResourceName, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.True(t, tc.Spec.Kueue.IsDisabled())
+	assert.Equal(t, v1alpha1.Scheduler{}, tc.Spec.Scheduler)
+
+	_, err = operatorClient.OperatorV1alpha1().TektonKueues().Get(ctx, v1alpha1.TektonKueueResourceName, metav1.GetOptions{})
+	assert.True(t, apierrs.IsNotFound(err))
+}
+
+func TestMigrateTektonSchedulerToTektonKueueKueueTakesPrecedence(t *testing.T) {
+	ctx := context.TODO()
+	operatorClient := operatorFake.NewSimpleClientset(&v1alpha1.TektonConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: v1alpha1.ConfigResourceName},
+		Spec: v1alpha1.TektonConfigSpec{
+			Scheduler: v1alpha1.Scheduler{
+				Disabled: ptr.Bool(false),
+				SchedulerConfig: v1alpha1.SchedulerConfig{Config: config.Config{
+					QueueName: "legacy-queue",
+				}},
+			},
+			Kueue: v1alpha1.Kueue{Disabled: ptr.Bool(true)},
+		},
+	})
+	logger := logging.FromContext(ctx).Named("unit-test")
+
+	assert.ErrorIs(t, migrateTektonSchedulerToTektonKueue(ctx, logger, nil, operatorClient, nil), v1alpha1.REQUEUE_EVENT_AFTER)
+
+	tc, err := operatorClient.OperatorV1alpha1().TektonConfigs().Get(ctx, v1alpha1.ConfigResourceName, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, ptr.Bool(true), tc.Spec.Kueue.Disabled)
+	assert.Empty(t, tc.Spec.Kueue.QueueName)
+	assert.Equal(t, v1alpha1.Scheduler{}, tc.Spec.Scheduler)
 }
 
 func TestUpgradePipelineProperties(t *testing.T) {
@@ -130,6 +268,101 @@ func TestUpgradePipelineProperties(t *testing.T) {
 			assert.Equal(t, *tcData.Spec.Pipeline.EnableStepActions, tt.expected)
 		})
 	}
+}
+
+func TestMigrateResultsRouteTLSToReencrypt(t *testing.T) {
+	tests := []struct {
+		name        string
+		termination string
+		expected    string
+	}{
+		{
+			name:        "edge is migrated to reencrypt",
+			termination: "edge",
+			expected:    "reencrypt",
+		},
+		{
+			name:        "reencrypt is left untouched",
+			termination: "reencrypt",
+			expected:    "reencrypt",
+		},
+		{
+			name:        "passthrough is left untouched",
+			termination: "passthrough",
+			expected:    "passthrough",
+		},
+		{
+			name:        "empty is left untouched",
+			termination: "",
+			expected:    "",
+		},
+	}
+
+	ctx := context.TODO()
+	logger := logging.FromContext(ctx).Named("unit-test")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("PLATFORM", "openshift")
+			operatorClient := operatorFake.NewSimpleClientset()
+
+			// no TektonConfig CR -> no error
+			err := migrateResultsRouteTLSToReencrypt(ctx, logger, nil, operatorClient, nil)
+			assert.NoError(t, err)
+
+			tc := &v1alpha1.TektonConfig{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: v1alpha1.ConfigResourceName,
+				},
+				Spec: v1alpha1.TektonConfigSpec{
+					Result: v1alpha1.Result{
+						ResultsAPIProperties: v1alpha1.ResultsAPIProperties{
+							RouteTLSTermination: tt.termination,
+						},
+					},
+				},
+			}
+			_, err = operatorClient.OperatorV1alpha1().TektonConfigs().Create(ctx, tc, metav1.CreateOptions{})
+			assert.NoError(t, err)
+
+			err = migrateResultsRouteTLSToReencrypt(ctx, logger, nil, operatorClient, nil)
+			assert.NoError(t, err)
+
+			tcData, err := operatorClient.OperatorV1alpha1().TektonConfigs().Get(ctx, v1alpha1.ConfigResourceName, metav1.GetOptions{})
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expected, tcData.Spec.Result.RouteTLSTermination)
+		})
+	}
+}
+
+func TestMigrateResultsRouteTLSToReencrypt_NonOpenShift(t *testing.T) {
+	t.Setenv("PLATFORM", "kubernetes")
+	ctx := context.TODO()
+	logger := logging.FromContext(ctx).Named("unit-test")
+	operatorClient := operatorFake.NewSimpleClientset()
+
+	tc := &v1alpha1.TektonConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: v1alpha1.ConfigResourceName,
+		},
+		Spec: v1alpha1.TektonConfigSpec{
+			Result: v1alpha1.Result{
+				ResultsAPIProperties: v1alpha1.ResultsAPIProperties{
+					RouteTLSTermination: "edge",
+				},
+			},
+		},
+	}
+	_, err := operatorClient.OperatorV1alpha1().TektonConfigs().Create(ctx, tc, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	// On non-OpenShift platforms the migration is a no-op and leaves edge untouched.
+	err = migrateResultsRouteTLSToReencrypt(ctx, logger, nil, operatorClient, nil)
+	assert.NoError(t, err)
+
+	tcData, err := operatorClient.OperatorV1alpha1().TektonConfigs().Get(ctx, v1alpha1.ConfigResourceName, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, "edge", tcData.Spec.Result.RouteTLSTermination)
 }
 
 func TestPreUpgradeTektonPruner(t *testing.T) {
@@ -199,11 +432,10 @@ func TestPreUpgradePipelinesAsCodeArtifacts(t *testing.T) {
 	t.Setenv("PLATFORM", "openshift")
 
 	tests := []struct {
-		name                   string
-		tc                     *v1alpha1.TektonConfig
-		expectedHubCatalogType string
-		expectedHubURL         string
-		shouldUpdate           bool
+		name           string
+		tc             *v1alpha1.TektonConfig
+		expectedHubURL string
+		shouldUpdate   bool
 	}{
 		{
 			name: "PAC enabled with no settings - should update",
@@ -213,7 +445,7 @@ func TestPreUpgradePipelinesAsCodeArtifacts(t *testing.T) {
 				},
 				Spec: v1alpha1.TektonConfigSpec{
 					Platforms: v1alpha1.Platforms{
-						OpenShift: v1alpha1.OpenShift{
+						OpenShift: &v1alpha1.OpenShift{
 							PipelinesAsCode: &v1alpha1.PipelinesAsCode{
 								Enable: ptr.Bool(true),
 							},
@@ -221,9 +453,8 @@ func TestPreUpgradePipelinesAsCodeArtifacts(t *testing.T) {
 					},
 				},
 			},
-			expectedHubCatalogType: "artifacthub",
-			expectedHubURL:         "https://artifacthub.io",
-			shouldUpdate:           true,
+			expectedHubURL: "https://artifacthub.io",
+			shouldUpdate:   true,
 		},
 		{
 			name: "PAC enabled with tektonhub settings - should update",
@@ -233,7 +464,7 @@ func TestPreUpgradePipelinesAsCodeArtifacts(t *testing.T) {
 				},
 				Spec: v1alpha1.TektonConfigSpec{
 					Platforms: v1alpha1.Platforms{
-						OpenShift: v1alpha1.OpenShift{
+						OpenShift: &v1alpha1.OpenShift{
 							PipelinesAsCode: &v1alpha1.PipelinesAsCode{
 								Enable: ptr.Bool(true),
 								PACSettings: v1alpha1.PACSettings{
@@ -247,9 +478,8 @@ func TestPreUpgradePipelinesAsCodeArtifacts(t *testing.T) {
 					},
 				},
 			},
-			expectedHubCatalogType: "artifacthub",
-			expectedHubURL:         "https://artifacthub.io",
-			shouldUpdate:           true,
+			expectedHubURL: "https://artifacthub.io",
+			shouldUpdate:   true,
 		},
 		{
 			name: "PAC enabled with old artifacthub API URL - should update",
@@ -259,7 +489,7 @@ func TestPreUpgradePipelinesAsCodeArtifacts(t *testing.T) {
 				},
 				Spec: v1alpha1.TektonConfigSpec{
 					Platforms: v1alpha1.Platforms{
-						OpenShift: v1alpha1.OpenShift{
+						OpenShift: &v1alpha1.OpenShift{
 							PipelinesAsCode: &v1alpha1.PipelinesAsCode{
 								Enable: ptr.Bool(true),
 								PACSettings: v1alpha1.PACSettings{
@@ -273,19 +503,18 @@ func TestPreUpgradePipelinesAsCodeArtifacts(t *testing.T) {
 					},
 				},
 			},
-			expectedHubCatalogType: "artifacthub",
-			expectedHubURL:         "https://artifacthub.io",
-			shouldUpdate:           true,
+			expectedHubURL: "https://artifacthub.io",
+			shouldUpdate:   true,
 		},
 		{
-			name: "PAC enabled with correct settings - should not update",
+			name: "PAC enabled with catalog type and current hub-url - should remove catalog type",
 			tc: &v1alpha1.TektonConfig{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: v1alpha1.ConfigResourceName,
 				},
 				Spec: v1alpha1.TektonConfigSpec{
 					Platforms: v1alpha1.Platforms{
-						OpenShift: v1alpha1.OpenShift{
+						OpenShift: &v1alpha1.OpenShift{
 							PipelinesAsCode: &v1alpha1.PipelinesAsCode{
 								Enable: ptr.Bool(true),
 								PACSettings: v1alpha1.PACSettings{
@@ -299,9 +528,8 @@ func TestPreUpgradePipelinesAsCodeArtifacts(t *testing.T) {
 					},
 				},
 			},
-			expectedHubCatalogType: "artifacthub",
-			expectedHubURL:         "https://artifacthub.io",
-			shouldUpdate:           false,
+			expectedHubURL: "https://artifacthub.io",
+			shouldUpdate:   true,
 		},
 		{
 			name: "PAC enabled with hub-catalog-name - should update and remove hub-catalog-name",
@@ -311,7 +539,7 @@ func TestPreUpgradePipelinesAsCodeArtifacts(t *testing.T) {
 				},
 				Spec: v1alpha1.TektonConfigSpec{
 					Platforms: v1alpha1.Platforms{
-						OpenShift: v1alpha1.OpenShift{
+						OpenShift: &v1alpha1.OpenShift{
 							PipelinesAsCode: &v1alpha1.PipelinesAsCode{
 								Enable: ptr.Bool(true),
 								PACSettings: v1alpha1.PACSettings{
@@ -326,9 +554,8 @@ func TestPreUpgradePipelinesAsCodeArtifacts(t *testing.T) {
 					},
 				},
 			},
-			expectedHubCatalogType: "artifacthub",
-			expectedHubURL:         "https://artifacthub.io",
-			shouldUpdate:           true,
+			expectedHubURL: "https://artifacthub.io",
+			shouldUpdate:   true,
 		},
 		{
 			name: "PAC enabled with tektonhub and hub-catalog-name - should update all",
@@ -338,7 +565,7 @@ func TestPreUpgradePipelinesAsCodeArtifacts(t *testing.T) {
 				},
 				Spec: v1alpha1.TektonConfigSpec{
 					Platforms: v1alpha1.Platforms{
-						OpenShift: v1alpha1.OpenShift{
+						OpenShift: &v1alpha1.OpenShift{
 							PipelinesAsCode: &v1alpha1.PipelinesAsCode{
 								Enable: ptr.Bool(true),
 								PACSettings: v1alpha1.PACSettings{
@@ -353,9 +580,8 @@ func TestPreUpgradePipelinesAsCodeArtifacts(t *testing.T) {
 					},
 				},
 			},
-			expectedHubCatalogType: "artifacthub",
-			expectedHubURL:         "https://artifacthub.io",
-			shouldUpdate:           true,
+			expectedHubURL: "https://artifacthub.io",
+			shouldUpdate:   true,
 		},
 	}
 
@@ -387,7 +613,8 @@ func TestPreUpgradePipelinesAsCodeArtifacts(t *testing.T) {
 				assert.NotNil(t, tcData.Spec.Platforms.OpenShift.PipelinesAsCode.PACSettings.Settings)
 
 				settings := tcData.Spec.Platforms.OpenShift.PipelinesAsCode.PACSettings.Settings
-				assert.Equal(t, tt.expectedHubCatalogType, settings["hub-catalog-type"])
+				_, hasCatalogType := settings["hub-catalog-type"]
+				assert.False(t, hasCatalogType, "hub-catalog-type should be removed from settings")
 				assert.Equal(t, tt.expectedHubURL, settings["hub-url"])
 
 				// Verify that hub-catalog-name is removed if it existed in the original settings
@@ -399,7 +626,6 @@ func TestPreUpgradePipelinesAsCodeArtifacts(t *testing.T) {
 }
 
 func TestPreUpgradePipelinesAsCodeArtifacts_NonOpenShift(t *testing.T) {
-	// Test on non-OpenShift platform
 	t.Setenv("PLATFORM", "kubernetes")
 
 	ctx := context.TODO()
@@ -407,9 +633,248 @@ func TestPreUpgradePipelinesAsCodeArtifacts_NonOpenShift(t *testing.T) {
 	operatorClient := operatorFake.NewSimpleClientset()
 	k8sClient := k8sFake.NewSimpleClientset()
 
-	// Should return early without error on non-OpenShift platform
-	err := preUpgradePipelinesAsCodeArtifacts(ctx, logger, k8sClient, operatorClient, nil)
+	// Create a TektonConfig CR with Kubernetes platform PipelinesAsCode with tektonhub settings
+	tc := &v1alpha1.TektonConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: v1alpha1.ConfigResourceName,
+		},
+		Spec: v1alpha1.TektonConfigSpec{
+			Platforms: v1alpha1.Platforms{
+				Kubernetes: &v1alpha1.Kubernetes{
+					PipelinesAsCode: &v1alpha1.PipelinesAsCode{
+						Enable: ptr.Bool(true),
+						PACSettings: v1alpha1.PACSettings{
+							Settings: map[string]string{
+								"hub-catalog-type": "tektonhub",
+								"hub-url":          "https://api.hub.tekton.dev/v1",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	_, err := operatorClient.OperatorV1alpha1().TektonConfigs().Create(ctx, tc, metav1.CreateOptions{})
 	assert.NoError(t, err)
+
+	// Run the upgrade function
+	err = preUpgradePipelinesAsCodeArtifacts(ctx, logger, k8sClient, operatorClient, nil)
+	assert.NoError(t, err)
+
+	// Verify the settings were updated to artifacthub
+	tcData, err := operatorClient.OperatorV1alpha1().TektonConfigs().Get(ctx, v1alpha1.ConfigResourceName, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.NotNil(t, tcData.Spec.Platforms.Kubernetes.PipelinesAsCode)
+	assert.NotNil(t, tcData.Spec.Platforms.Kubernetes.PipelinesAsCode.PACSettings.Settings)
+
+	settings := tcData.Spec.Platforms.Kubernetes.PipelinesAsCode.PACSettings.Settings
+	_, hasCatalogType := settings["hub-catalog-type"]
+	assert.False(t, hasCatalogType, "hub-catalog-type should be removed from settings")
+	assert.Equal(t, "https://artifacthub.io", settings["hub-url"])
+}
+
+func TestPreUpgradePipelinesAsCodeArtifacts_RemovesHubCatalogType(t *testing.T) {
+	targetNamespace := "openshift-pipelines"
+
+	tests := []struct {
+		name           string
+		platform       string
+		tcSettings     map[string]string
+		pacSettings    map[string]string
+		cmData         map[string]string
+		expectTCHubURL string
+		// OpenShift updates the Pipelines as Code CR. Kubernetes leaves it unchanged.
+		updatePAC bool
+	}{
+		{
+			name:     "OpenShift removes catalog keys and migrates tekton hub URL",
+			platform: "openshift",
+			tcSettings: map[string]string{
+				"hub-catalog-type": "tektonhub",
+				"hub-catalog-name": "tekton",
+				"hub-url":          "https://api.hub.tekton.dev/v1",
+				"application-name": "Pipelines as Code CI",
+				"catalog-1-id":     "custom",
+				"catalog-1-type":   "tektonhub",
+			},
+			pacSettings: map[string]string{
+				"hub-catalog-type": "tektonhub",
+				"hub-catalog-name": "tekton",
+				"hub-url":          "https://api.hub.tekton.dev/v1",
+				"application-name": "Pipelines as Code CI",
+				"catalog-1-id":     "custom",
+				"catalog-1-type":   "tektonhub",
+			},
+			cmData: map[string]string{
+				"hub-catalog-type": "tektonhub",
+				"hub-catalog-name": "tekton",
+				"hub-url":          "https://api.hub.tekton.dev/v1",
+				"application-name": "Pipelines as Code CI",
+				"catalog-1-id":     "custom",
+				"catalog-1-type":   "tektonhub",
+			},
+			expectTCHubURL: "https://artifacthub.io",
+			updatePAC:      true,
+		},
+		{
+			name:     "OpenShift removes catalog type and migrates artifact hub API URL",
+			platform: "openshift",
+			tcSettings: map[string]string{
+				"hub-catalog-type": "artifacthub",
+				"hub-url":          "https://artifacthub.io/api/v1",
+				"application-name": "Pipelines as Code CI",
+			},
+			pacSettings: map[string]string{
+				"hub-catalog-type": "artifacthub",
+				"hub-url":          "https://artifacthub.io/api/v1",
+				"application-name": "Pipelines as Code CI",
+			},
+			cmData: map[string]string{
+				"hub-catalog-type": "artifacthub",
+				"hub-url":          "https://artifacthub.io/api/v1",
+				"application-name": "Pipelines as Code CI",
+			},
+			expectTCHubURL: "https://artifacthub.io",
+			updatePAC:      true,
+		},
+		{
+			name:     "OpenShift removes an empty hub-catalog-type and keeps the current hub URL",
+			platform: "openshift",
+			tcSettings: map[string]string{
+				"hub-catalog-type": "",
+				"hub-url":          "https://artifacthub.io",
+				"catalog-1-name":   "tekton",
+				"catalog-1-url":    "https://api.custom.hub/v1",
+			},
+			pacSettings: map[string]string{
+				"hub-catalog-type": "",
+				"hub-catalog-name": "",
+				"hub-url":          "https://artifacthub.io",
+				"catalog-1-name":   "tekton",
+			},
+			cmData: map[string]string{
+				"hub-catalog-type": "",
+				"hub-url":          "https://artifacthub.io",
+				"catalog-1-url":    "https://api.custom.hub/v1",
+			},
+			expectTCHubURL: "https://artifacthub.io",
+			updatePAC:      true,
+		},
+		{
+			name:     "Kubernetes removes catalog keys from TektonConfig and the config map",
+			platform: "kubernetes",
+			tcSettings: map[string]string{
+				"hub-catalog-type": "tektonhub",
+				"hub-catalog-name": "tekton",
+				"hub-url":          "https://artifacthub.io/api/v1",
+				"application-name": "Pipelines as Code CI",
+			},
+			pacSettings: map[string]string{
+				"hub-catalog-type": "tektonhub",
+				"hub-catalog-name": "tekton",
+				"hub-url":          "https://artifacthub.io/api/v1",
+			},
+			cmData: map[string]string{
+				"hub-catalog-type": "tektonhub",
+				"hub-catalog-name": "tekton",
+				"hub-url":          "https://artifacthub.io/api/v1",
+				"application-name": "Pipelines as Code CI",
+			},
+			expectTCHubURL: "https://artifacthub.io",
+			updatePAC:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("PLATFORM", tt.platform)
+
+			ctx := context.TODO()
+			logger := logging.FromContext(ctx).Named("unit-test")
+			operatorClient := operatorFake.NewSimpleClientset()
+			k8sClient := k8sFake.NewSimpleClientset()
+
+			tc := &v1alpha1.TektonConfig{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: v1alpha1.ConfigResourceName,
+				},
+				Spec: v1alpha1.TektonConfigSpec{
+					CommonSpec: v1alpha1.CommonSpec{
+						TargetNamespace: targetNamespace,
+					},
+				},
+			}
+			pac := &v1alpha1.PipelinesAsCode{
+				Enable: ptr.Bool(true),
+				PACSettings: v1alpha1.PACSettings{
+					Settings: tt.tcSettings,
+				},
+			}
+			if tt.platform == "openshift" {
+				tc.Spec.Platforms.OpenShift = &v1alpha1.OpenShift{PipelinesAsCode: pac}
+			} else {
+				tc.Spec.Platforms.Kubernetes = &v1alpha1.Kubernetes{PipelinesAsCode: pac}
+			}
+			_, err := operatorClient.OperatorV1alpha1().TektonConfigs().Create(ctx, tc, metav1.CreateOptions{})
+			assert.NoError(t, err)
+
+			_, err = operatorClient.OperatorV1alpha1().OpenShiftPipelinesAsCodes().Create(ctx, &v1alpha1.OpenShiftPipelinesAsCode{
+				ObjectMeta: metav1.ObjectMeta{Name: v1alpha1.OpenShiftPipelinesAsCodeName},
+				Spec: v1alpha1.OpenShiftPipelinesAsCodeSpec{
+					PACSettings: v1alpha1.PACSettings{Settings: tt.pacSettings},
+				},
+			}, metav1.CreateOptions{})
+			assert.NoError(t, err)
+
+			_, err = k8sClient.CoreV1().ConfigMaps(targetNamespace).Create(ctx, &v1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: "pipelines-as-code", Namespace: targetNamespace},
+				Data:       tt.cmData,
+			}, metav1.CreateOptions{})
+			assert.NoError(t, err)
+
+			err = preUpgradePipelinesAsCodeArtifacts(ctx, logger, k8sClient, operatorClient, nil)
+			assert.NoError(t, err)
+
+			updatedTC, err := operatorClient.OperatorV1alpha1().TektonConfigs().Get(ctx, v1alpha1.ConfigResourceName, metav1.GetOptions{})
+			assert.NoError(t, err)
+			var tcSettings map[string]string
+			if tt.platform == "openshift" {
+				tcSettings = updatedTC.Spec.Platforms.OpenShift.PipelinesAsCode.PACSettings.Settings
+			} else {
+				tcSettings = updatedTC.Spec.Platforms.Kubernetes.PipelinesAsCode.PACSettings.Settings
+			}
+			assertRemovedHubCatalogKeys(t, tcSettings, tt.tcSettings)
+			assert.Equal(t, tt.expectTCHubURL, tcSettings["hub-url"])
+
+			updatedPAC, err := operatorClient.OperatorV1alpha1().OpenShiftPipelinesAsCodes().Get(ctx, v1alpha1.OpenShiftPipelinesAsCodeName, metav1.GetOptions{})
+			assert.NoError(t, err)
+			if tt.updatePAC {
+				assertRemovedHubCatalogKeys(t, updatedPAC.Spec.Settings, tt.pacSettings)
+				assert.Equal(t, tt.pacSettings["hub-url"], updatedPAC.Spec.Settings["hub-url"])
+			} else {
+				assert.Equal(t, tt.pacSettings, updatedPAC.Spec.Settings)
+			}
+
+			updatedCM, err := k8sClient.CoreV1().ConfigMaps(targetNamespace).Get(ctx, "pipelines-as-code", metav1.GetOptions{})
+			assert.NoError(t, err)
+			assertRemovedHubCatalogKeys(t, updatedCM.Data, tt.cmData)
+			assert.Equal(t, tt.cmData["hub-url"], updatedCM.Data["hub-url"])
+		})
+	}
+}
+
+func assertRemovedHubCatalogKeys(t *testing.T, got, original map[string]string) {
+	t.Helper()
+	_, hasType := got["hub-catalog-type"]
+	assert.False(t, hasType, "hub-catalog-type should be removed")
+	_, hasName := got["hub-catalog-name"]
+	assert.False(t, hasName, "hub-catalog-name should be removed")
+	for key, value := range original {
+		if key == "hub-catalog-type" || key == "hub-catalog-name" || key == "hub-url" {
+			continue
+		}
+		assert.Equal(t, value, got[key])
+	}
 }
 
 func TestPreUpgradePipelinesAsCodeArtifacts_NoTektonConfig(t *testing.T) {
@@ -452,13 +917,13 @@ func TestUpdatePipelinesAsCodeConfigMap(t *testing.T) {
 			expectUpdate: true,
 		},
 		{
-			name: "ConfigMap with multiple hub settings but no hub-catalog-name - should not update",
+			name: "ConfigMap with hub-catalog-type - should remove",
 			configMapData: map[string]string{
 				"hub-url":          "https://artifacthub.io",
-				"hub-catalog-type": "artifacthub",
+				"hub-catalog-type": "tektonhub",
 				"other-setting":    "value",
 			},
-			expectUpdate: false,
+			expectUpdate: true,
 		},
 		{
 			name: "ConfigMap with only hub-catalog-name - should remove",
@@ -540,13 +1005,18 @@ func TestUpdatePipelinesAsCodeConfigMap(t *testing.T) {
 				updatedCM, err := k8sClient.CoreV1().ConfigMaps(targetNamespace).Get(ctx, "pipelines-as-code", metav1.GetOptions{})
 				assert.NoError(t, err)
 
-				// hub-catalog-name should be removed
+				// hub-catalog-name and hub-catalog-type should be removed
 				_, exists := updatedCM.Data["hub-catalog-name"]
 				assert.False(t, exists, "hub-catalog-name should be removed from config map")
+				_, hasCatalogType := updatedCM.Data["hub-catalog-type"]
+				assert.False(t, hasCatalogType, "hub-catalog-type should be removed from config map")
 
-				// Other settings should remain
+				// Other settings, including hub-url, should remain
 				if originalValue, hadOtherSetting := tt.configMapData["other-setting"]; hadOtherSetting {
 					assert.Equal(t, originalValue, updatedCM.Data["other-setting"])
+				}
+				if originalURL, hadHubURL := tt.configMapData["hub-url"]; hadHubURL {
+					assert.Equal(t, originalURL, updatedCM.Data["hub-url"])
 				}
 			}
 		})
@@ -646,7 +1116,7 @@ func TestUpdateOpenShiftPipelinesAsCodeCR(t *testing.T) {
 			expectUpdate: true,
 		},
 		{
-			name: "PAC CR with multiple hub settings but no hub-catalog-name - should not update",
+			name: "PAC CR with hub-catalog-type - should remove",
 			pacCR: &v1alpha1.OpenShiftPipelinesAsCode{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: v1alpha1.OpenShiftPipelinesAsCodeName,
@@ -661,7 +1131,7 @@ func TestUpdateOpenShiftPipelinesAsCodeCR(t *testing.T) {
 					},
 				},
 			},
-			expectUpdate: false,
+			expectUpdate: true,
 		},
 		{
 			name: "PAC CR without hub-catalog-name - should not update",
@@ -737,13 +1207,18 @@ func TestUpdateOpenShiftPipelinesAsCodeCR(t *testing.T) {
 				updatedPAC, err := operatorClient.OperatorV1alpha1().OpenShiftPipelinesAsCodes().Get(ctx, v1alpha1.OpenShiftPipelinesAsCodeName, metav1.GetOptions{})
 				assert.NoError(t, err)
 
-				// hub-catalog-name should be removed
+				// hub-catalog-name and hub-catalog-type should be removed
 				_, exists := updatedPAC.Spec.PACSettings.Settings["hub-catalog-name"]
 				assert.False(t, exists, "hub-catalog-name should be removed from PAC CR settings")
+				_, hasCatalogType := updatedPAC.Spec.PACSettings.Settings["hub-catalog-type"]
+				assert.False(t, hasCatalogType, "hub-catalog-type should be removed from PAC CR settings")
 
-				// Other settings should remain
+				// Other settings, including hub-url, should remain
 				if originalValue, hadOtherSetting := originalSettings["other-setting"]; hadOtherSetting {
 					assert.Equal(t, originalValue, updatedPAC.Spec.PACSettings.Settings["other-setting"])
+				}
+				if originalURL, hadHubURL := originalSettings["hub-url"]; hadHubURL {
+					assert.Equal(t, originalURL, updatedPAC.Spec.PACSettings.Settings["hub-url"])
 				}
 			}
 		})
@@ -758,6 +1233,135 @@ func TestUpdateOpenShiftPipelinesAsCodeCR_NotFound(t *testing.T) {
 	// Should return without error when PAC CR doesn't exist
 	err := updateOpenShiftPipelinesAsCodeCR(ctx, logger, operatorClient)
 	assert.NoError(t, err)
+}
+
+func TestPreUpgradeManualApprovalGate(t *testing.T) {
+	ctx := context.TODO()
+	logger := logging.FromContext(ctx).Named("unit-test")
+
+	t.Run("no TektonConfig CR", func(t *testing.T) {
+		operatorClient := operatorFake.NewSimpleClientset()
+		err := preUpgradeManualApprovalGate(ctx, logger, nil, operatorClient, nil)
+		assert.NoError(t, err)
+	})
+
+	t.Run("MAG already enabled in TektonConfig", func(t *testing.T) {
+		operatorClient := operatorFake.NewSimpleClientset()
+		tc := &v1alpha1.TektonConfig{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: v1alpha1.ConfigResourceName,
+			},
+			Spec: v1alpha1.TektonConfigSpec{
+				ManualApproval: v1alpha1.ManualApproval{
+					Disabled: ptr.Bool(false),
+				},
+			},
+		}
+		_, err := operatorClient.OperatorV1alpha1().TektonConfigs().Create(ctx, tc, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		err = preUpgradeManualApprovalGate(ctx, logger, nil, operatorClient, nil)
+		assert.NoError(t, err)
+	})
+
+	t.Run("no standalone MAG CR exists", func(t *testing.T) {
+		operatorClient := operatorFake.NewSimpleClientset()
+		tc := &v1alpha1.TektonConfig{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: v1alpha1.ConfigResourceName,
+			},
+		}
+		_, err := operatorClient.OperatorV1alpha1().TektonConfigs().Create(ctx, tc, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		err = preUpgradeManualApprovalGate(ctx, logger, nil, operatorClient, nil)
+		assert.NoError(t, err)
+
+		// verify MAG is still disabled
+		updated, err := operatorClient.OperatorV1alpha1().TektonConfigs().Get(ctx, v1alpha1.ConfigResourceName, metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.True(t, updated.Spec.ManualApproval.IsDisabled())
+	})
+
+	t.Run("MAG CR exists with ownerRef - skip adoption", func(t *testing.T) {
+		operatorClient := operatorFake.NewSimpleClientset()
+		tc := &v1alpha1.TektonConfig{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: v1alpha1.ConfigResourceName,
+			},
+		}
+		_, err := operatorClient.OperatorV1alpha1().TektonConfigs().Create(ctx, tc, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		mag := &v1alpha1.ManualApprovalGate{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: v1alpha1.ManualApprovalGates,
+				OwnerReferences: []metav1.OwnerReference{
+					{Name: v1alpha1.ConfigResourceName, Kind: "TektonConfig"},
+				},
+			},
+		}
+		_, err = operatorClient.OperatorV1alpha1().ManualApprovalGates().Create(ctx, mag, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		err = preUpgradeManualApprovalGate(ctx, logger, nil, operatorClient, nil)
+		assert.NoError(t, err)
+
+		// verify MAG is still disabled in TektonConfig
+		updated, err := operatorClient.OperatorV1alpha1().TektonConfigs().Get(ctx, v1alpha1.ConfigResourceName, metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.True(t, updated.Spec.ManualApproval.IsDisabled())
+	})
+
+	t.Run("standalone MAG CR adopted with config preserved", func(t *testing.T) {
+		operatorClient := operatorFake.NewSimpleClientset()
+		tc := &v1alpha1.TektonConfig{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: v1alpha1.ConfigResourceName,
+			},
+			Spec: v1alpha1.TektonConfigSpec{
+				CommonSpec: v1alpha1.CommonSpec{
+					TargetNamespace: "tekton-pipelines",
+				},
+			},
+		}
+		_, err := operatorClient.OperatorV1alpha1().TektonConfigs().Create(ctx, tc, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		// create standalone MAG CR with user config (Options with configMaps)
+		mag := &v1alpha1.ManualApprovalGate{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: v1alpha1.ManualApprovalGates,
+			},
+			Spec: v1alpha1.ManualApprovalGateSpec{
+				CommonSpec: v1alpha1.CommonSpec{
+					TargetNamespace: "tekton-pipelines",
+				},
+				ManualApproval: v1alpha1.ManualApproval{
+					Options: v1alpha1.AdditionalOptions{
+						ConfigMaps: map[string]v1.ConfigMap{
+							"manual-approval-gate-config": {
+								Data: map[string]string{
+									"custom-key": "custom-value",
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		_, err = operatorClient.OperatorV1alpha1().ManualApprovalGates().Create(ctx, mag, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		err = preUpgradeManualApprovalGate(ctx, logger, nil, operatorClient, nil)
+		assert.NoError(t, err)
+
+		// verify TektonConfig now has MAG enabled with user's config preserved
+		updated, err := operatorClient.OperatorV1alpha1().TektonConfigs().Get(ctx, v1alpha1.ConfigResourceName, metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.False(t, updated.Spec.ManualApproval.IsDisabled())
+		assert.Equal(t, "custom-value", updated.Spec.ManualApproval.Options.ConfigMaps["manual-approval-gate-config"].Data["custom-key"])
+	})
 }
 
 func TestRemoveDeprecatedDisableAffinityAssistant(t *testing.T) {
@@ -797,4 +1401,65 @@ func TestRemoveDeprecatedDisableAffinityAssistant(t *testing.T) {
 			assert.False(t, exists, "disable-affinity-assistant field should not exist")
 		}
 	}
+}
+
+func TestMigrateLegacyNamespaceSyncParams(t *testing.T) {
+	ctx := context.TODO()
+	logger := logging.FromContext(ctx).Named("unit-test")
+
+	t.Run("non-openshift platform: no-op", func(t *testing.T) {
+		operatorClient := operatorFake.NewSimpleClientset()
+		err := migrateLegacyNamespaceSyncParams(ctx, logger, nil, operatorClient, nil)
+		assert.NoError(t, err)
+	})
+
+	t.Run("no TektonConfig CR: no-op", func(t *testing.T) {
+		t.Setenv("PLATFORM", "openshift")
+		operatorClient := operatorFake.NewSimpleClientset()
+		err := migrateLegacyNamespaceSyncParams(ctx, logger, nil, operatorClient, nil)
+		assert.NoError(t, err)
+	})
+
+	t.Run("no legacy params: no update issued", func(t *testing.T) {
+		t.Setenv("PLATFORM", "openshift")
+		operatorClient := operatorFake.NewSimpleClientset()
+		tc := &v1alpha1.TektonConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: v1alpha1.ConfigResourceName},
+		}
+		_, err := operatorClient.OperatorV1alpha1().TektonConfigs().Create(ctx, tc, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		err = migrateLegacyNamespaceSyncParams(ctx, logger, nil, operatorClient, nil)
+		assert.NoError(t, err)
+
+		got, err := operatorClient.OperatorV1alpha1().TektonConfigs().Get(ctx, v1alpha1.ConfigResourceName, metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.Equal(t, 0, len(got.Spec.Params))
+	})
+
+	t.Run("legacy params are migrated and persisted", func(t *testing.T) {
+		t.Setenv("PLATFORM", "openshift")
+		operatorClient := operatorFake.NewSimpleClientset()
+		tc := &v1alpha1.TektonConfig{
+			ObjectMeta: metav1.ObjectMeta{Name: v1alpha1.ConfigResourceName},
+			Spec: v1alpha1.TektonConfigSpec{
+				Params: []v1alpha1.Param{
+					{Name: "createRbacResource", Value: "false"},
+				},
+			},
+		}
+		_, err := operatorClient.OperatorV1alpha1().TektonConfigs().Create(ctx, tc, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		err = migrateLegacyNamespaceSyncParams(ctx, logger, nil, operatorClient, nil)
+		assert.NoError(t, err)
+
+		got, err := operatorClient.OperatorV1alpha1().TektonConfigs().Get(ctx, v1alpha1.ConfigResourceName, metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.Equal(t, 0, len(got.Spec.Params))
+		ns := got.Spec.Platforms.OpenShift.NamespaceSync
+		if ns == nil || ns.CreatePipelineSA == nil || *ns.CreatePipelineSA {
+			t.Fatalf("expected namespaceSync.createPipelineSA=false, got %+v", ns)
+		}
+	})
 }

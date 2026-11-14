@@ -22,6 +22,10 @@ type ManualApprovalGateExpansion interface{}
 
 type OpenShiftPipelinesAsCodeExpansion interface{}
 
+type SharedResourceExpansion interface{}
+
+type ShipwrightBuildExpansion interface{}
+
 type SyncerServiceExpansion interface{}
 
 type TektonAddonExpansion interface{}
@@ -32,9 +36,9 @@ type TektonConfigExpansion interface{}
 
 type TektonDashboardExpansion interface{}
 
-type TektonHubExpansion interface{}
-
 type TektonInstallerSetExpansion interface{}
+
+type TektonKueueExpansion interface{}
 
 type TektonMulticlusterProxyAAEExpansion interface{}
 

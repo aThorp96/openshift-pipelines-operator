@@ -99,11 +99,13 @@ spec:
   replicas: 1
   selector:
     matchLabels:
-      name: tekton-operator
+      name: tekton-operator-proxy-webhook
   template:
     metadata:
+      annotations:
+        openshift.io/required-scc: restricted-v2
       labels:
-        name: tekton-operator
+        name: tekton-operator-proxy-webhook
         app: tekton-operator
     spec:
       securityContext:
@@ -131,6 +133,8 @@ spec:
             - name: https-webhook
               containerPort: 8443
           securityContext:
+            runAsNonRoot: true
+            privileged: false
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
@@ -160,7 +164,7 @@ spec:
       port: 443
       targetPort: 8443
   selector:
-    name: tekton-operator
+    name: tekton-operator-proxy-webhook
 
 ---
 

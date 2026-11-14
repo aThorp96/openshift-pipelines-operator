@@ -52,10 +52,13 @@ func EnsureTektonConfigExists(kubeClientSet *kubernetes.Clientset, clients opera
 	tcCR, err := clients.Get(context.TODO(), names.TektonConfig, metav1.GetOptions{})
 
 	if cm.Data["AUTOINSTALL_COMPONENTS"] == "true" {
-		if err != nil {
+		if err != nil && !apierrs.IsNotFound(err) {
 			return nil, err
 		}
-		return tcCR, nil
+		if err == nil {
+			return tcCR, nil
+		}
+		// Fall through to create it if not found
 	}
 
 	if apierrs.IsNotFound(err) {
@@ -204,10 +207,6 @@ func WaitForTektonConfigReady(client operatorV1alpha1.TektonConfigInterface, nam
 		// 2. Even if the Pod has started properly, it may not have entered the
 		//    Reconcile logic yet, which could also lead to instability.
 		//    For example:
-		//      In the testing logic of TektonHub, it immediately deletes the
-		//      CR of TektonHub and then polls whether the CR has been cleaned up.
-		//      At this point, the tekton-operator enters the Reconcile logic and
-		//      automatically creates the CR of TektonHub again, causing the test to fail.
 		return readyCount >= 3, nil
 	}
 

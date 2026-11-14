@@ -26,6 +26,14 @@ type ManualApprovalGateListerExpansion interface{}
 // OpenShiftPipelinesAsCodeLister.
 type OpenShiftPipelinesAsCodeListerExpansion interface{}
 
+// SharedResourceListerExpansion allows custom methods to be added to
+// SharedResourceLister.
+type SharedResourceListerExpansion interface{}
+
+// ShipwrightBuildListerExpansion allows custom methods to be added to
+// ShipwrightBuildLister.
+type ShipwrightBuildListerExpansion interface{}
+
 // SyncerServiceListerExpansion allows custom methods to be added to
 // SyncerServiceLister.
 type SyncerServiceListerExpansion interface{}
@@ -46,13 +54,13 @@ type TektonConfigListerExpansion interface{}
 // TektonDashboardLister.
 type TektonDashboardListerExpansion interface{}
 
-// TektonHubListerExpansion allows custom methods to be added to
-// TektonHubLister.
-type TektonHubListerExpansion interface{}
-
 // TektonInstallerSetListerExpansion allows custom methods to be added to
 // TektonInstallerSetLister.
 type TektonInstallerSetListerExpansion interface{}
+
+// TektonKueueListerExpansion allows custom methods to be added to
+// TektonKueueLister.
+type TektonKueueListerExpansion interface{}
 
 // TektonMulticlusterProxyAAEListerExpansion allows custom methods to be added to
 // TektonMulticlusterProxyAAELister.

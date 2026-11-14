@@ -31,19 +31,21 @@ import (
 )
 
 var types = map[schema.GroupVersionKind]resourcesemantics.GenericCRD{
-	v1alpha1.SchemeGroupVersion.WithKind(v1alpha1.KindTektonConfig):   &v1alpha1.TektonConfig{},
-	v1alpha1.SchemeGroupVersion.WithKind(v1alpha1.KindTektonPipeline): &v1alpha1.TektonPipeline{},
-	v1alpha1.SchemeGroupVersion.WithKind(v1alpha1.KindTektonTrigger):  &v1alpha1.TektonTrigger{},
-	v1alpha1.SchemeGroupVersion.WithKind(v1alpha1.KindTektonHub):      &v1alpha1.TektonHub{},
-	v1alpha1.SchemeGroupVersion.WithKind(v1alpha1.KindTektonResult):   &v1alpha1.TektonResult{},
-	v1alpha1.SchemeGroupVersion.WithKind(v1alpha1.KindTektonChain):    &v1alpha1.TektonChain{},
-	v1alpha1.SchemeGroupVersion.WithKind(v1alpha1.KindTektonPruner):   &v1alpha1.TektonPruner{},
+	v1alpha1.SchemeGroupVersion.WithKind(v1alpha1.KindTektonConfig):       &v1alpha1.TektonConfig{},
+	v1alpha1.SchemeGroupVersion.WithKind(v1alpha1.KindTektonPipeline):     &v1alpha1.TektonPipeline{},
+	v1alpha1.SchemeGroupVersion.WithKind(v1alpha1.KindTektonTrigger):      &v1alpha1.TektonTrigger{},
+	v1alpha1.SchemeGroupVersion.WithKind(v1alpha1.KindTektonResult):       &v1alpha1.TektonResult{},
+	v1alpha1.SchemeGroupVersion.WithKind(v1alpha1.KindTektonChain):        &v1alpha1.TektonChain{},
+	v1alpha1.SchemeGroupVersion.WithKind(v1alpha1.KindTektonPruner):       &v1alpha1.TektonPruner{},
+	v1alpha1.SchemeGroupVersion.WithKind(v1alpha1.KindManualApprovalGate): &v1alpha1.ManualApprovalGate{},
+	v1alpha1.SchemeGroupVersion.WithKind(v1alpha1.KindShipwrightBuild):    &v1alpha1.ShipwrightBuild{},
 }
 
 func SetTypes(platform string) {
 	if platform == "openshift" {
 		types[v1alpha1.SchemeGroupVersion.WithKind(v1alpha1.KindTektonAddon)] = &v1alpha1.TektonAddon{}
 		types[v1alpha1.SchemeGroupVersion.WithKind(v1alpha1.KindOpenShiftPipelinesAsCode)] = &v1alpha1.OpenShiftPipelinesAsCode{}
+		types[v1alpha1.SchemeGroupVersion.WithKind(v1alpha1.KindSharedResource)] = &v1alpha1.SharedResource{}
 	} else {
 		types[v1alpha1.SchemeGroupVersion.WithKind(v1alpha1.KindTektonDashboard)] = &v1alpha1.TektonDashboard{}
 	}

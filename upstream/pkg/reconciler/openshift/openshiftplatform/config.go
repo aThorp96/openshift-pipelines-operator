@@ -19,17 +19,19 @@ package openshiftplatform
 import (
 	k8sInstallerSet "github.com/tektoncd/operator/pkg/reconciler/kubernetes/tektoninstallerset"
 	openshiftManualApprovalGate "github.com/tektoncd/operator/pkg/reconciler/openshift/manualapprovalgate"
+	"github.com/tektoncd/operator/pkg/reconciler/openshift/namespacesync"
 	"github.com/tektoncd/operator/pkg/reconciler/openshift/openshiftpipelinesascode"
+	"github.com/tektoncd/operator/pkg/reconciler/openshift/sharedresource"
+	"github.com/tektoncd/operator/pkg/reconciler/openshift/shipwrightbuild"
 	openshiftSyncerService "github.com/tektoncd/operator/pkg/reconciler/openshift/syncerservice"
 	openshiftAddon "github.com/tektoncd/operator/pkg/reconciler/openshift/tektonaddon"
 	openshiftChain "github.com/tektoncd/operator/pkg/reconciler/openshift/tektonchain"
 	openshiftConfig "github.com/tektoncd/operator/pkg/reconciler/openshift/tektonconfig"
-	openshiftHub "github.com/tektoncd/operator/pkg/reconciler/openshift/tektonhub"
+	openshiftKueue "github.com/tektoncd/operator/pkg/reconciler/openshift/tektonkueue"
 	openshiftMulticlusterProxyAAE "github.com/tektoncd/operator/pkg/reconciler/openshift/tektonmulticlusterproxyaae"
 	openshiftPipeline "github.com/tektoncd/operator/pkg/reconciler/openshift/tektonpipeline"
 	openshiftPruner "github.com/tektoncd/operator/pkg/reconciler/openshift/tektonpruner"
 	openshiftResult "github.com/tektoncd/operator/pkg/reconciler/openshift/tektonresult"
-	openshiftScheduler "github.com/tektoncd/operator/pkg/reconciler/openshift/tektonscheduler"
 	openshiftTrigger "github.com/tektoncd/operator/pkg/reconciler/openshift/tektontrigger"
 	"github.com/tektoncd/operator/pkg/reconciler/platform"
 	"knative.dev/pkg/injection"
@@ -55,10 +57,6 @@ var (
 		platform.ControllerTektonTrigger: injection.NamedControllerConstructor{
 			Name:                  string(platform.ControllerTektonTrigger),
 			ControllerConstructor: openshiftTrigger.NewController,
-		},
-		platform.ControllerTektonHub: injection.NamedControllerConstructor{
-			Name:                  string(platform.ControllerTektonHub),
-			ControllerConstructor: openshiftHub.NewController,
 		},
 		platform.ControllerTektonChain: injection.NamedControllerConstructor{
 			Name:                  string(platform.ControllerTektonChain),
@@ -89,9 +87,9 @@ var (
 			Name:                  string(platform.ControllerTektonPruner),
 			ControllerConstructor: openshiftPruner.NewController,
 		},
-		platform.ControllerTektonScheduler: injection.NamedControllerConstructor{
-			Name:                  string(platform.ControllerTektonScheduler),
-			ControllerConstructor: openshiftScheduler.NewController,
+		platform.ControllerTektonKueue: injection.NamedControllerConstructor{
+			Name:                  string(platform.ControllerTektonKueue),
+			ControllerConstructor: openshiftKueue.NewController,
 		},
 		platform.ControllerMulticlusterProxyAAE: injection.NamedControllerConstructor{
 			Name:                  string(platform.ControllerMulticlusterProxyAAE),
@@ -100,6 +98,20 @@ var (
 		platform.ControllerSyncerService: injection.NamedControllerConstructor{
 			Name:                  string(platform.ControllerSyncerService),
 			ControllerConstructor: openshiftSyncerService.NewController,
+		},
+		platform.ControllerNamespaceSync: injection.NamedControllerConstructor{
+			Name:                  string(platform.ControllerNamespaceSync),
+			ControllerConstructor: namespacesync.NewController,
+		},
+		// Register the Shipwright Build and Shared Resource controllers so the
+		// OpenShift operator can reconcile these openshift-builds components.
+		platform.ControllerShipwrightBuild: injection.NamedControllerConstructor{
+			Name:                  string(platform.ControllerShipwrightBuild),
+			ControllerConstructor: shipwrightbuild.NewController,
+		},
+		platform.ControllerSharedResource: injection.NamedControllerConstructor{
+			Name:                  string(platform.ControllerSharedResource),
+			ControllerConstructor: sharedresource.NewController,
 		},
 	}
 )
