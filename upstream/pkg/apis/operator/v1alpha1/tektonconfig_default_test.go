@@ -18,15 +18,116 @@ package v1alpha1
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	dynamicclient "github.com/tektoncd/operator/pkg/client/injection/dynamic"
+	"github.com/tektoncd/tekton-kueue/pkg/config"
 
 	"gotest.tools/v3/assert"
 	"knative.dev/pkg/ptr"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 )
+
+func openShiftBuildContext(t *testing.T, shipwrightState, sharedResourceState string, found bool) context.Context {
+	t.Helper()
+	var objects []runtime.Object
+	if found {
+		build := &unstructured.Unstructured{Object: map[string]interface{}{
+			"apiVersion": "operator.openshift.io/v1alpha1",
+			"kind":       "OpenShiftBuild",
+			"metadata":   map[string]interface{}{"name": "cluster"},
+		}}
+		if shipwrightState != "" {
+			assert.NilError(t, unstructured.SetNestedField(build.Object, shipwrightState, "spec", "shipwright", "build", "state"))
+		}
+		if sharedResourceState != "" {
+			assert.NilError(t, unstructured.SetNestedField(build.Object, sharedResourceState, "spec", "sharedResource", "state"))
+		}
+		objects = append(objects, build)
+	}
+	return dynamicclient.WithClient(context.Background(), dynamicfake.NewSimpleDynamicClient(runtime.NewScheme(), objects...))
+}
+
+func Test_SetDefaults_OpenShiftBuildComponents(t *testing.T) {
+	t.Setenv("PLATFORM", "openshift")
+	for _, tc := range []struct {
+		name                string
+		shipwrightState     string
+		sharedResourceState string
+		found               bool
+		enabled             bool
+	}{
+		{name: "both standalone components enabled", shipwrightState: "Enabled", sharedResourceState: "Enabled", found: true},
+		{name: "standalone defaults enabled", found: true},
+		{name: "only standalone CSI enabled", shipwrightState: "Disabled", sharedResourceState: "Enabled", found: true},
+		{name: "only standalone Shipwright enabled", shipwrightState: "Enabled", sharedResourceState: "Disabled", found: true},
+		{name: "both standalone components disabled", shipwrightState: "Disabled", sharedResourceState: "Disabled", found: true},
+		{name: "standalone absent", enabled: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config := &TektonConfig{}
+			ctx := openShiftBuildContext(t, tc.shipwrightState, tc.sharedResourceState, tc.found)
+			config.SetDefaults(ctx)
+			assert.Equal(t, config.Spec.Platforms.OpenShift.ShipwrightBuild.Enabled, tc.enabled)
+			assert.Equal(t, config.Spec.Platforms.OpenShift.SharedResource.Enabled, tc.enabled)
+			client := dynamicclient.Get(ctx).(*dynamicfake.FakeDynamicClient)
+			assert.Equal(t, len(client.Actions()), 1, "both defaults must share one legacy CR lookup")
+		})
+	}
+}
+
+func Test_SetDefaults_OpenShiftBuildComponentsPreserveExplicitValues(t *testing.T) {
+	t.Setenv("PLATFORM", "openshift")
+	for _, tc := range []struct {
+		name       string
+		found      bool
+		configured bool
+	}{
+		{name: "explicit enable with standalone Builds", found: true, configured: true},
+		{name: "explicit disable without standalone Builds"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			platform := &OpenShift{
+				ShipwrightBuild: &ShipwrightBuildConfig{Enabled: tc.configured},
+				SharedResource:  &SharedResourceConfig{Enabled: tc.configured},
+			}
+			config := &TektonConfig{Spec: TektonConfigSpec{Platforms: Platforms{OpenShift: platform}}}
+			ctx := openShiftBuildContext(t, "Enabled", "Enabled", tc.found)
+			config.SetDefaults(ctx)
+			assert.Equal(t, platform.ShipwrightBuild.Enabled, tc.configured)
+			assert.Equal(t, platform.SharedResource.Enabled, tc.configured)
+			client := dynamicclient.Get(ctx).(*dynamicfake.FakeDynamicClient)
+			assert.Equal(t, len(client.Actions()), 0, "explicit component blocks must skip detection")
+		})
+	}
+}
+
+func Test_SetDefaults_OpenShiftBuildComponentsPreserveOneExplicitValue(t *testing.T) {
+	t.Setenv("PLATFORM", "openshift")
+	platform := &OpenShift{ShipwrightBuild: &ShipwrightBuildConfig{Enabled: true}}
+	config := &TektonConfig{Spec: TektonConfigSpec{Platforms: Platforms{OpenShift: platform}}}
+	ctx := openShiftBuildContext(t, "Disabled", "Enabled", true)
+	config.SetDefaults(ctx)
+	assert.Equal(t, platform.ShipwrightBuild.Enabled, true)
+	assert.Equal(t, platform.SharedResource.Enabled, false)
+}
+
+func Test_SetDefaults_KubernetesSkipsStandaloneBuildsDetection(t *testing.T) {
+	t.Setenv("PLATFORM", "kubernetes")
+	ctx := openShiftBuildContext(t, "Enabled", "Enabled", true)
+	config := &TektonConfig{}
+	config.SetDefaults(ctx)
+	assert.Assert(t, config.Spec.Platforms.OpenShift == nil)
+	assert.Equal(t, config.Spec.Platforms.Kubernetes.ShipwrightBuild.Enabled, false)
+	client := dynamicclient.Get(ctx).(*dynamicfake.FakeDynamicClient)
+	assert.Equal(t, len(client.Actions()), 0)
+}
 
 func Test_SetDefaults_OpenShift_MigratesKubernetesPipelinesAsCode(t *testing.T) {
 	t.Setenv("PLATFORM", "openshift")
@@ -40,16 +141,82 @@ func Test_SetDefaults_OpenShift_MigratesKubernetesPipelinesAsCode(t *testing.T) 
 		Spec: TektonConfigSpec{
 			CommonSpec: CommonSpec{TargetNamespace: "ns"},
 			Platforms: Platforms{
-				Kubernetes: Kubernetes{PipelinesAsCode: kpac},
+				Kubernetes: &Kubernetes{PipelinesAsCode: kpac},
 			},
 		},
 	}
 	tc.SetDefaults(context.TODO())
-	if tc.Spec.Platforms.Kubernetes.PipelinesAsCode != nil {
-		t.Fatalf("expected kubernetes.pipelinesAsCode cleared after migration, got %+v", tc.Spec.Platforms.Kubernetes.PipelinesAsCode)
+	if tc.Spec.Platforms.Kubernetes != nil {
+		t.Fatalf("expected kubernetes platform nil after migration, got %+v", tc.Spec.Platforms.Kubernetes)
 	}
-	if tc.Spec.Platforms.OpenShift.PipelinesAsCode == nil || tc.Spec.Platforms.OpenShift.PipelinesAsCode.PACSettings.Settings["application-name"] != "test" {
-		t.Fatalf("expected PAC migrated to openshift, got %+v", tc.Spec.Platforms.OpenShift.PipelinesAsCode)
+	if tc.Spec.Platforms.OpenShift == nil || tc.Spec.Platforms.OpenShift.PipelinesAsCode == nil || tc.Spec.Platforms.OpenShift.PipelinesAsCode.PACSettings.Settings["application-name"] != "test" {
+		t.Fatalf("expected PAC migrated to openshift, got %+v", tc.Spec.Platforms.OpenShift)
+	}
+}
+
+func Test_SetDefaults_MigratesDeprecatedScheduler(t *testing.T) {
+	legacy := Scheduler{
+		Disabled: ptr.Bool(false),
+		SchedulerConfig: SchedulerConfig{Config: config.Config{
+			QueueName: "legacy-queue",
+		}},
+	}
+	tc := &TektonConfig{Spec: TektonConfigSpec{Scheduler: legacy}}
+
+	tc.SetDefaults(context.TODO())
+
+	want := legacy.ToKueue()
+	want.FleetManager = FleetManagerManual
+	if diff := cmp.Diff(want, tc.Spec.Kueue); diff != "" {
+		t.Fatalf("migrated kueue config differs (-want, +got): %s", diff)
+	}
+	if diff := cmp.Diff(Scheduler{}, tc.Spec.Scheduler); diff != "" {
+		t.Fatalf("deprecated scheduler field was not cleared (-want, +got): %s", diff)
+	}
+	data, err := json.Marshal(tc.Spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw["scheduler"]; ok {
+		t.Fatalf("deprecated scheduler field remains in serialized spec: %s", data)
+	}
+}
+
+func Test_SetDefaults_MigratesEnabledSchedulerWithoutQueue(t *testing.T) {
+	tc := &TektonConfig{Spec: TektonConfigSpec{Scheduler: Scheduler{
+		Disabled: ptr.Bool(false),
+	}}}
+
+	tc.SetDefaults(context.TODO())
+
+	if tc.Spec.Kueue.IsDisabled() {
+		t.Fatal("migrated kueue was disabled")
+	}
+	if tc.Spec.Kueue.QueueName != "" {
+		t.Fatalf("queue name = %q, want empty", tc.Spec.Kueue.QueueName)
+	}
+	if diff := cmp.Diff(Scheduler{}, tc.Spec.Scheduler); diff != "" {
+		t.Fatalf("deprecated scheduler field was not cleared (-want, +got): %s", diff)
+	}
+}
+
+func TestMigrateSchedulerKeepsExplicitKueue(t *testing.T) {
+	legacy := Scheduler{Disabled: ptr.Bool(false)}
+	explicit := Kueue{Disabled: ptr.Bool(true)}
+	spec := TektonConfigSpec{Scheduler: legacy, Kueue: explicit}
+
+	if !spec.MigrateScheduler() {
+		t.Fatal("expected deprecated scheduler field to be migrated")
+	}
+	if diff := cmp.Diff(explicit, spec.Kueue); diff != "" {
+		t.Fatalf("explicit kueue config was overwritten (-want, +got): %s", diff)
+	}
+	if diff := cmp.Diff(Scheduler{}, spec.Scheduler); diff != "" {
+		t.Fatalf("deprecated scheduler field was not cleared (-want, +got): %s", diff)
 	}
 }
 
@@ -211,7 +378,7 @@ func Test_SetDefaults_PipelineAsCode(t *testing.T) {
 				Spec: TektonConfigSpec{
 					Addon: Addon{EnablePAC: ptr.Bool(false)},
 					Platforms: Platforms{
-						OpenShift: OpenShift{
+						OpenShift: &OpenShift{
 							PipelinesAsCode: &PipelinesAsCode{Enable: ptr.Bool(true)},
 						},
 					},
@@ -227,7 +394,7 @@ func Test_SetDefaults_PipelineAsCode(t *testing.T) {
 				Spec: TektonConfigSpec{
 					Addon: Addon{EnablePAC: ptr.Bool(false)},
 					Platforms: Platforms{
-						Kubernetes: Kubernetes{
+						Kubernetes: &Kubernetes{
 							PipelinesAsCode: &PipelinesAsCode{Enable: ptr.Bool(true)},
 						},
 					},
@@ -272,6 +439,99 @@ func Test_SetDefaults_PipelineAsCode(t *testing.T) {
 	}
 }
 
+func Test_MigrateLegacyNamespaceSyncParams(t *testing.T) {
+	tests := []struct {
+		name           string
+		inputParams    []Param
+		wantChanged    bool
+		wantParams     []Param
+		wantPipelineSA *bool
+		wantCABundles  *bool
+		wantEditRB     *bool
+	}{
+		{
+			name:        "no legacy params present: nothing changes",
+			inputParams: []Param{{Name: "other-param", Value: "x"}},
+			wantChanged: false,
+			wantParams:  []Param{{Name: "other-param", Value: "x"}},
+		},
+		{
+			name: "legacy params are migrated and removed",
+			inputParams: []Param{
+				{Name: "createRbacResource", Value: "true"},
+				{Name: "createCABundleConfigMaps", Value: "false"},
+				{Name: "legacyPipelineRbac", Value: "true"},
+				{Name: "unrelated-param", Value: "keep-me"},
+			},
+			wantChanged:    true,
+			wantParams:     []Param{{Name: "unrelated-param", Value: "keep-me"}},
+			wantPipelineSA: ptr.Bool(true),
+			wantCABundles:  ptr.Bool(false),
+			wantEditRB:     ptr.Bool(true),
+		},
+		{
+			name: "createRbacResource=false disables SCC and edit RoleBinding too",
+			inputParams: []Param{
+				{Name: "createRbacResource", Value: "false"},
+			},
+			wantChanged:    true,
+			wantParams:     []Param{},
+			wantPipelineSA: ptr.Bool(false),
+			wantEditRB:     ptr.Bool(false),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tc := &TektonConfig{
+				Spec: TektonConfigSpec{
+					Params: test.inputParams,
+				},
+			}
+
+			changed := MigrateLegacyNamespaceSyncParams(tc)
+			if changed != test.wantChanged {
+				t.Errorf("MigrateLegacyNamespaceSyncParams() changed = %v, want %v", changed, test.wantChanged)
+			}
+			if !cmp.Equal(tc.Spec.Params, test.wantParams) {
+				t.Errorf("Spec.Params = %+v, want %+v", tc.Spec.Params, test.wantParams)
+			}
+			ns := tc.Spec.Platforms.OpenShift.NamespaceSync
+			if test.wantPipelineSA != nil && (ns.CreatePipelineSA == nil || *ns.CreatePipelineSA != *test.wantPipelineSA) {
+				t.Errorf("CreatePipelineSA = %v, want %v", ns.CreatePipelineSA, *test.wantPipelineSA)
+			}
+			if test.wantCABundles != nil && (ns.CreateCABundles == nil || *ns.CreateCABundles != *test.wantCABundles) {
+				t.Errorf("CreateCABundles = %v, want %v", ns.CreateCABundles, *test.wantCABundles)
+			}
+			if test.wantEditRB != nil && (ns.CreateEditRoleBinding == nil || *ns.CreateEditRoleBinding != *test.wantEditRB) {
+				t.Errorf("CreateEditRoleBinding = %v, want %v", ns.CreateEditRoleBinding, *test.wantEditRB)
+			}
+		})
+	}
+}
+
+// Calling MigrateLegacyNamespaceSyncParams a second time (e.g. a retried
+// upgrade) must be a no-op: once the legacy params are gone, "changed"
+// should report false and previously-migrated typed fields must be left
+// untouched rather than being reset to new defaults.
+func Test_MigrateLegacyNamespaceSyncParams_Idempotent(t *testing.T) {
+	tc := &TektonConfig{
+		Spec: TektonConfigSpec{
+			Params: []Param{{Name: "createRbacResource", Value: "false"}},
+		},
+	}
+
+	if changed := MigrateLegacyNamespaceSyncParams(tc); !changed {
+		t.Fatalf("expected first migration to report changed")
+	}
+	if changed := MigrateLegacyNamespaceSyncParams(tc); changed {
+		t.Fatalf("expected second migration to be a no-op")
+	}
+	if ns := tc.Spec.Platforms.OpenShift.NamespaceSync; ns.CreatePipelineSA == nil || *ns.CreatePipelineSA {
+		t.Errorf("expected CreatePipelineSA to remain false after second migration, got %v", ns.CreatePipelineSA)
+	}
+}
+
 func Test_SetDefaults_SCC(t *testing.T) {
 	t.Setenv("PLATFORM", "openshift")
 
@@ -284,14 +544,16 @@ func Test_SetDefaults_SCC(t *testing.T) {
 			name:     "default SCC is set to 'pipelines-scc' when nothing is set",
 			inputSCC: nil,
 			expectedSCC: &SCC{
-				Default: PipelinesSCC,
+				Default:    PipelinesSCC,
+				MaxAllowed: PipelinesSCC,
 			},
 		},
 		{
 			name:     "defaulting works when default SCC is empty",
 			inputSCC: &SCC{},
 			expectedSCC: &SCC{
-				Default: PipelinesSCC,
+				Default:    PipelinesSCC,
+				MaxAllowed: PipelinesSCC,
 			},
 		},
 		{
@@ -310,7 +572,41 @@ func Test_SetDefaults_SCC(t *testing.T) {
 				Default: "alreadyExistingSCC",
 			},
 			expectedSCC: &SCC{
-				Default: "alreadyExistingSCC",
+				Default:    "alreadyExistingSCC",
+				MaxAllowed: "alreadyExistingSCC",
+			},
+		},
+		{
+			name: "maxAllowed defaults to default SCC when only default is set",
+			inputSCC: &SCC{
+				Default:    "custom-scc",
+				MaxAllowed: "",
+			},
+			expectedSCC: &SCC{
+				Default:    "custom-scc",
+				MaxAllowed: "custom-scc",
+			},
+		},
+		{
+			name: "maxAllowed is not overridden when explicitly set",
+			inputSCC: &SCC{
+				Default:    PipelinesSCC,
+				MaxAllowed: "privileged",
+			},
+			expectedSCC: &SCC{
+				Default:    PipelinesSCC,
+				MaxAllowed: "privileged",
+			},
+		},
+		{
+			name: "empty maxAllowed gets defaulted to prevent escalation",
+			inputSCC: &SCC{
+				Default:    PipelinesSCC,
+				MaxAllowed: "",
+			},
+			expectedSCC: &SCC{
+				Default:    PipelinesSCC,
+				MaxAllowed: PipelinesSCC,
 			},
 		},
 	}
@@ -319,7 +615,7 @@ func Test_SetDefaults_SCC(t *testing.T) {
 		tektonConfig := TektonConfig{
 			Spec: TektonConfigSpec{
 				Platforms: Platforms{
-					OpenShift: OpenShift{
+					OpenShift: &OpenShift{
 						SCC: test.inputSCC,
 					},
 				},

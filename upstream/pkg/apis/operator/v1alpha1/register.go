@@ -50,9 +50,6 @@ const (
 	// KindTektonInstallerSet is the Kind of TektonInstallerSet in a GVK context.
 	KindTektonInstallerSet = "TektonInstallerSet"
 
-	// KindTektonHub is the Kind of TektonHub in a GVK context.
-	KindTektonHub = "TektonHub"
-
 	// KindTektonChain is the Kind of Tekton Chain in a GVK context.
 	KindTektonChain = "TektonChain"
 
@@ -65,7 +62,10 @@ const (
 	// KindTektonPruner is the Kind of TektonPruner in a GVK context.
 	KindTektonPruner = "TektonPruner"
 
-	// KindTektonScheduler is the Kind of TektonScheduler in a GVK context.
+	// KindTektonKueue is the Kind of TektonKueue in a GVK context.
+	KindTektonKueue = "TektonKueue"
+
+	// KindTektonScheduler is retained for deprecated API compatibility.
 	KindTektonScheduler = "TektonScheduler"
 
 	// KindTektonMulticlusterProxyAAE is the Kind of TektonMulticlusterProxyAAE in a GVK context.
@@ -73,6 +73,12 @@ const (
 
 	// KindSyncerService is the Kind of SyncerService in a GVK context.
 	KindSyncerService = "SyncerService"
+
+	// KindShipwrightBuild is the Kind of ShipwrightBuild in a GVK context.
+	KindShipwrightBuild = "ShipwrightBuild"
+
+	// KindSharedResource is the Kind of SharedResource in a GVK context.
+	KindSharedResource = "SharedResource"
 )
 
 // Resource takes an unqualified resource and returns a Group qualified GroupResource
@@ -98,8 +104,6 @@ func addKnownTypes(s *runtime.Scheme) error {
 		&TektonResultList{},
 		&TektonInstallerSet{},
 		&TektonInstallerSetList{},
-		&TektonHub{},
-		&TektonHubList{},
 		&TektonChain{},
 		&TektonChainList{},
 		&OpenShiftPipelinesAsCode{},
@@ -108,12 +112,18 @@ func addKnownTypes(s *runtime.Scheme) error {
 		&ManualApprovalGateList{},
 		&TektonPruner{},
 		&TektonPrunerList{},
+		&TektonKueue{},
+		&TektonKueueList{},
 		&TektonScheduler{},
 		&TektonSchedulerList{},
 		&TektonMulticlusterProxyAAE{},
 		&TektonMulticlusterProxyAAEList{},
 		&SyncerService{},
 		&SyncerServiceList{},
+		&ShipwrightBuild{},
+		&ShipwrightBuildList{},
+		&SharedResource{},
+		&SharedResourceList{},
 	)
 	metav1.AddToGroupVersion(s, SchemeGroupVersion)
 	return nil

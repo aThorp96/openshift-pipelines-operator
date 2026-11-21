@@ -9,6 +9,8 @@ metadata:
     console.openshift.io/plugins: '["pipelines-console-plugin"]'
     description: Red Hat OpenShift Pipelines is a cloud-native CI/CD solution for building pipelines using Tekton concepts which run natively on OpenShift and Kubernetes.
     operators.operatorframework.io/builder: operator-sdk-v1.7.2
+    olm.skipRange: '>=1.6.0 <1.7.0'
+    operators.openshift.io/infrastructure-features: '["disconnected","proxy-aware"]'
     features.operators.openshift.io/disconnected: "true"
     features.operators.openshift.io/fips-compliant: "true"
     features.operators.openshift.io/proxy-aware: "true"
@@ -19,7 +21,7 @@ metadata:
     features.operators.openshift.io/cnf: "false"
     features.operators.openshift.io/cni: "false"
     features.operators.openshift.io/csi: "false"
-    operators.operatorframework.io/internal-objects: '["tektoninstallersets.operator.tekton.dev", "tektonconfigs.operator.tekton.dev","tektonpipelines.operator.tekton.dev","tektontriggers.operator.tekton.dev","tektonaddons.operator.tekton.dev", "tektonhubs.operator.tekton.dev", "tektonresults.operator.tekton.dev", "tektonchains.operator.tekton.dev", "openshiftpipelinesascodes.operator.tekton.dev", "manualapprovalgates.operator.tekton.dev","tektonpruners.operator.tekton.dev","tektonschedulers.operator.tekton.dev","tektonmulticlusterproxyaaes.operator.tekton.dev","syncerservices.operator.tekton.dev"]'
+    operators.operatorframework.io/internal-objects: '["tektoninstallersets.operator.tekton.dev", "tektonconfigs.operator.tekton.dev","tektonpipelines.operator.tekton.dev","tektontriggers.operator.tekton.dev","tektonaddons.operator.tekton.dev", "tektonresults.operator.tekton.dev", "tektonchains.operator.tekton.dev", "openshiftpipelinesascodes.operator.tekton.dev", "manualapprovalgates.operator.tekton.dev","tektonpruners.operator.tekton.dev","tektonkueues.operator.tekton.dev","tektonschedulers.operator.tekton.dev","tektonmulticlusterproxyaaes.operator.tekton.dev","syncerservices.operator.tekton.dev","tektondashboards.operator.tekton.dev"]'
     repository: https://github.com/tektoncd/operator
     support: Red Hat
   labels:
@@ -176,27 +178,6 @@ spec:
         x-descriptors:
         - urn:alm:descriptor:com.tectonic.ui:label
       version: v1alpha1
-    - description: Represents an installation of latest version of Hub
-      displayName: Tekton Hub
-      kind: TektonHub
-      name: tektonhubs.operator.tekton.dev
-      resources:
-      - kind: tektoninstallersets
-        name: ''
-        version: v1alpha1
-      specDescriptors:
-      - description: Namespace where Addons installed
-        displayName: Target Namespace
-        path: targetNamespace
-        x-descriptors:
-        - urn:alm:descriptor:com.tectonic.ui:label
-      statusDescriptors:
-      - description: The version of Addons installed
-        displayName: Version
-        path: version
-        x-descriptors:
-        - urn:alm:descriptor:com.tectonic.ui:label
-      version: v1alpha1
     - description: Represents an installation of latest version of OpenShift Pipelines As Code
       displayName: OpenShift Pipelines As Code
       kind: OpenShiftPipelinesAsCode
@@ -260,8 +241,29 @@ spec:
           x-descriptors:
             - urn:alm:descriptor:com.tectonic.ui:label
       version: v1alpha1
-    - description: Represents an installation of latest version of Tekton Scheduler
-      displayName: Tekton Scheduler
+    - description: Represents an installation of latest version of Tekton Kueue
+      displayName: Tekton Kueue
+      kind: TektonKueue
+      name: tektonkueues.operator.tekton.dev
+      resources:
+        - kind: tektoninstallersets
+          name: ''
+          version: v1alpha1
+      specDescriptors:
+        - description: Namespace where Tekton Kueue installed
+          displayName: Target Namespace
+          path: targetNamespace
+          x-descriptors:
+            - urn:alm:descriptor:com.tectonic.ui:label
+      statusDescriptors:
+        - description: The version of Tekton Kueue installed
+          displayName: Version
+          path: version
+          x-descriptors:
+            - urn:alm:descriptor:com.tectonic.ui:label
+      version: v1alpha1
+    - description: Deprecated compatibility API; configuration is migrated to TektonKueue
+      displayName: Tekton Scheduler (deprecated)
       kind: TektonScheduler
       name: tektonschedulers.operator.tekton.dev
       resources:
@@ -269,13 +271,13 @@ spec:
           name: ''
           version: v1alpha1
       specDescriptors:
-        - description: Namespace where Tekton Scheduler installed
+        - description: Namespace where Tekton Scheduler was installed
           displayName: Target Namespace
           path: targetNamespace
           x-descriptors:
             - urn:alm:descriptor:com.tectonic.ui:label
       statusDescriptors:
-        - description: The version of Tekton Scheduler installed
+        - description: The version of Tekton Scheduler previously installed
           displayName: Version
           path: version
           x-descriptors:
@@ -399,11 +401,10 @@ spec:
     - Tekton Triggers: {{ with index .Versions "triggers"}}{{ .Version }}{{end}}
     - Pipelines as Code: {{ with index .Versions "pipelines-as-code"}}{{ .Version }}{{end}}
     - Tekton Chains: {{ with index .Versions "chains"}}{{ .Version }}{{end}}
-    - Tekton Hub (tech-preview): {{ with index .Versions "hub"}}{{ .Version }}{{end}}
     - Tekton Results (tech-preview): {{ with index .Versions "results"}}{{ .Version }}{{end}}
     - Manual Approval Gate (tech-preview): {{ with index .Versions "manual-approval-gate"}}{{ .Version }}{{end}}
     - Tekton Pruner: {{ with index .Versions "pruner"}}{{ .Version }}{{end}}
-    - Tekton Scheduler (tech-preview): {{ with index .Versions "scheduler"}}{{ .Version }}{{end}}
+    - Tekton Kueue (tech-preview): {{ with index .Versions "kueue"}}{{ .Version }}{{end}}
     - Multicluster Proxy AAE (tech-preview): {{ with index .Versions "multicluster-proxy-aae"}}{{ .Version }}{{end}}
 
     ## Getting Started

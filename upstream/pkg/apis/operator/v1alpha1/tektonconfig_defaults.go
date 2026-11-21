@@ -18,13 +18,149 @@ package v1alpha1
 
 import (
 	"context"
+	"fmt"
+	"reflect"
 	"strings"
 
+	dynamicclient "github.com/tektoncd/operator/pkg/client/injection/dynamic"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"knative.dev/pkg/logging"
 	"knative.dev/pkg/ptr"
 )
 
+// isOpenShiftBuildsInstalled detects standalone Builds using OpenShiftBuild/cluster.
+// Detection is best-effort so an unavailable legacy API does not prevent
+// If detection fails, assume OpenShiftBuilds Operator is installed.
+// TektonConfig admission.
+func isOpenShiftBuildsInstalled(ctx context.Context) (bool, error) {
+	client := dynamicclient.Get(ctx)
+	if client == nil {
+		return false, fmt.Errorf("unable to get dynamic client")
+	}
+
+	// Fetch the OpenShiftBuild cluster resource
+	gvr := schema.GroupVersionResource{
+		Group:    "operator.openshift.io",
+		Version:  "v1alpha1",
+		Resource: "openshiftbuilds",
+	}
+
+	if _, err := client.Resource(gvr).Get(ctx, "cluster", metav1.GetOptions{}); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	return true, nil
+}
+
+// MigrateScheduler copies the deprecated scheduler configuration to kueue.
+// An explicitly configured kueue field takes precedence.
+func (spec *TektonConfigSpec) MigrateScheduler() bool {
+	if reflect.DeepEqual(spec.Scheduler, Scheduler{}) {
+		return false
+	}
+	// CRD defaulting can populate the fleet manager before legacy migration.
+	kueue := spec.Kueue
+	if kueue.FleetManager == FleetManagerManual {
+		kueue.FleetManager = ""
+	}
+	if reflect.DeepEqual(kueue, Kueue{}) {
+		spec.Kueue = spec.Scheduler.ToKueue()
+	}
+	spec.Scheduler = Scheduler{}
+	return true
+}
+
+// migrateNamespaceSyncParams reads the legacy stringly-typed spec.params entries
+// (createRbacResource, createCABundleConfigMaps, legacyPipelineRbac) and populates
+// the equivalent typed fields in spec.platforms.openshift.namespaceSync, then removes
+// the migrated params from the slice. Params that are already absent are left at their
+// typed-field defaults (true). This runs only on OpenShift.
+//
+// Original semantics (preserved here):
+//   - createRbacResource=false  → master RBAC switch off; disables SA, SCC RoleBinding,
+//     AND edit RoleBinding, regardless of legacyPipelineRbac.
+//   - createCABundleConfigMaps=false → disables CA bundle ConfigMaps only.
+//   - legacyPipelineRbac=false → disables edit RoleBinding, but only when
+//     createRbacResource is true (or absent).
+func migrateNamespaceSyncParams(tc *TektonConfig) {
+	if tc.Spec.Platforms.OpenShift == nil {
+		return
+	}
+	ns := tc.Spec.Platforms.OpenShift.NamespaceSync
+
+	// First pass: resolve the master RBAC switch so that its precedence over
+	// legacyPipelineRbac is respected regardless of param ordering in the slice.
+	masterRBACEnabled := true
+	for _, p := range tc.Spec.Params {
+		if p.Name == "createRbacResource" && p.Value == "false" {
+			masterRBACEnabled = false
+			break
+		}
+	}
+
+	remaining := tc.Spec.Params[:0]
+	for _, p := range tc.Spec.Params {
+		switch p.Name {
+		case "createRbacResource":
+			if ns.CreatePipelineSA == nil {
+				ns.CreatePipelineSA = ptr.Bool(masterRBACEnabled)
+			}
+			if !masterRBACEnabled {
+				// createRbacResource=false disabled all per-namespace RBAC in the
+				// old implementation. Carry that forward to the typed fields.
+				if ns.CreateSCCRoleBinding == nil {
+					ns.CreateSCCRoleBinding = ptr.Bool(false)
+				}
+				if ns.CreateEditRoleBinding == nil {
+					ns.CreateEditRoleBinding = ptr.Bool(false)
+				}
+			}
+		case "createCABundleConfigMaps":
+			if ns.CreateCABundles == nil {
+				ns.CreateCABundles = ptr.Bool(p.Value != "false")
+			}
+		case "legacyPipelineRbac":
+			// legacyPipelineRbac only had effect when createRbacResource was
+			// enabled; the master switch took precedence when it was false.
+			if masterRBACEnabled && ns.CreateEditRoleBinding == nil {
+				ns.CreateEditRoleBinding = ptr.Bool(p.Value != "false")
+			}
+		default:
+			remaining = append(remaining, p)
+		}
+	}
+	tc.Spec.Params = remaining
+}
+
+// MigrateLegacyNamespaceSyncParams is the exported entry point used by the
+// pre-upgrade job (pkg/reconciler/shared/tektonconfig/upgrade) to persist the
+// same createRbacResource/createCABundleConfigMaps/legacyPipelineRbac →
+// namespaceSync migration that SetDefaults already applies in-memory on every
+// reconcile. SetDefaults never writes back to the stored CR, so without this,
+// the deprecated params would remain in spec.params forever. It reports
+// whether tc was actually changed, so the caller only issues an Update when
+// there is something to persist.
+// TODO: Remove this function once createRbacResource/createCABundleConfigMaps/
+// legacyPipelineRbac are no longer supported.
+func MigrateLegacyNamespaceSyncParams(tc *TektonConfig) bool {
+	before := len(tc.Spec.Params)
+	if tc.Spec.Platforms.OpenShift == nil {
+		tc.Spec.Platforms.OpenShift = &OpenShift{}
+	}
+	if tc.Spec.Platforms.OpenShift.NamespaceSync == nil {
+		tc.Spec.Platforms.OpenShift.NamespaceSync = &NamespaceSyncConfig{}
+	}
+	migrateNamespaceSyncParams(tc)
+	return len(tc.Spec.Params) != before
+}
+
 func (tc *TektonConfig) SetDefaults(ctx context.Context) {
+	logger := logging.FromContext(ctx)
 	if tc.Spec.Profile == "" {
 		tc.Spec.Profile = ProfileBasic
 	}
@@ -33,19 +169,25 @@ func (tc *TektonConfig) SetDefaults(ctx context.Context) {
 	tc.Spec.Chain.setDefaults()
 	tc.Spec.Result.setDefaults()
 	tc.Spec.TektonPruner.SetDefaults()
-	tc.Spec.Scheduler.SetDefaults()
+	tc.Spec.MigrateScheduler()
+	tc.Spec.Kueue.SetDefaults()
+	tc.Spec.ManualApproval.setDefaults()
 
 	if IsOpenShiftPlatform() {
+		if tc.Spec.Platforms.OpenShift == nil {
+			tc.Spec.Platforms.OpenShift = &OpenShift{}
+		}
+
 		// PAC may appear under spec.platforms.kubernetes if the mutating webhook ran without
 		// PLATFORM=openshift (e.g. wrong image/order) or from older releases. Move it to
 		// spec.platforms.openshift so the stored TektonConfig matches the OpenShift operator.
-		if tc.Spec.Platforms.Kubernetes.PipelinesAsCode != nil {
+		if tc.Spec.Platforms.Kubernetes != nil && tc.Spec.Platforms.Kubernetes.PipelinesAsCode != nil {
 			if tc.Spec.Platforms.OpenShift.PipelinesAsCode == nil {
 				p := *tc.Spec.Platforms.Kubernetes.PipelinesAsCode
 				tc.Spec.Platforms.OpenShift.PipelinesAsCode = &p
 			}
-			tc.Spec.Platforms.Kubernetes.PipelinesAsCode = nil
 		}
+		tc.Spec.Platforms.Kubernetes = nil
 
 		if tc.Spec.Platforms.OpenShift.PipelinesAsCode != nil {
 			tc.Spec.Addon.EnablePAC = nil
@@ -84,10 +226,61 @@ func (tc *TektonConfig) SetDefaults(ctx context.Context) {
 		if tc.Spec.Platforms.OpenShift.SCC.Default == "" {
 			tc.Spec.Platforms.OpenShift.SCC.Default = PipelinesSCC
 		}
+		//Security: Default maxAllowed to match default SCC to prevent privilege escalation
+		// via namespace annotations. Empty maxAllowed previously allowed ANY SCC.
+		if tc.Spec.Platforms.OpenShift.SCC.MaxAllowed == "" {
+			tc.Spec.Platforms.OpenShift.SCC.MaxAllowed = tc.Spec.Platforms.OpenShift.SCC.Default
+		}
+
+		// NamespaceSync defaulting: initialise the block if absent, then apply
+		// per-field defaults (all true) and migrate any legacy spec.params entries.
+		if tc.Spec.Platforms.OpenShift.NamespaceSync == nil {
+			tc.Spec.Platforms.OpenShift.NamespaceSync = &NamespaceSyncConfig{}
+		}
+		ns := tc.Spec.Platforms.OpenShift.NamespaceSync
+		migrateNamespaceSyncParams(tc)
+		if ns.CreatePipelineSA == nil {
+			ns.CreatePipelineSA = ptr.Bool(true)
+		}
+		if ns.CreateCABundles == nil {
+			ns.CreateCABundles = ptr.Bool(true)
+		}
+		if ns.CreateEditRoleBinding == nil {
+			ns.CreateEditRoleBinding = ptr.Bool(true)
+		}
+		if ns.CreateSCCRoleBinding == nil {
+			ns.CreateSCCRoleBinding = ptr.Bool(true)
+		}
+
+		// Leave both Builds components to the standalone operator when its CR
+		// exists, regardless of its component states. Explicit user settings win.
+		// TODO: Remove this check after OpenShift Builds Operator is decommissioned
+		enableComponent := true
+		if tc.Spec.Platforms.OpenShift.ShipwrightBuild == nil || tc.Spec.Platforms.OpenShift.SharedResource == nil {
+			if installed, err := isOpenShiftBuildsInstalled(ctx); err != nil {
+				// If there's error, assume OpenShift Builds is installed and disable Shipwright and Shared Resource
+				logger.Error("Error detecting OpenShift Builds installation, Shipwright and Shared Resource will be disabled", err)
+				enableComponent = false
+			} else {
+				enableComponent = !installed
+			}
+		}
+		if tc.Spec.Platforms.OpenShift.ShipwrightBuild == nil {
+			tc.Spec.Platforms.OpenShift.ShipwrightBuild = &ShipwrightBuildConfig{Enabled: enableComponent}
+		}
+
+		if tc.Spec.Platforms.OpenShift.SharedResource == nil {
+			tc.Spec.Platforms.OpenShift.SharedResource = &SharedResourceConfig{Enabled: enableComponent}
+		}
 
 		setAddonDefaults(&tc.Spec.Addon)
 	} else {
 		// Kubernetes Platform
+		if tc.Spec.Platforms.Kubernetes == nil {
+			tc.Spec.Platforms.Kubernetes = &Kubernetes{}
+		}
+		tc.Spec.Platforms.OpenShift = nil
+
 		if tc.Spec.Platforms.Kubernetes.PipelinesAsCode == nil {
 			tc.Spec.Platforms.Kubernetes.PipelinesAsCode = &PipelinesAsCode{
 				Enable: ptr.Bool(true),
@@ -108,6 +301,13 @@ func (tc *TektonConfig) SetDefaults(ctx context.Context) {
 			logger := logging.FromContext(ctx)
 			tc.Spec.Platforms.Kubernetes.PipelinesAsCode.PACSettings.setPACDefaults(logger)
 		}
+
+		// ShipwrightBuild is disabled by default on Kubernetes. Only default when the
+		// block is absent so an explicit user block (incl. enabled: true) is kept.
+		if tc.Spec.Platforms.Kubernetes.ShipwrightBuild == nil {
+			tc.Spec.Platforms.Kubernetes.ShipwrightBuild = &ShipwrightBuildConfig{Enabled: false}
+		}
+
 		setAddonDefaults(&tc.Spec.Addon)
 	}
 

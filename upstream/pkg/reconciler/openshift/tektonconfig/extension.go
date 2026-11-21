@@ -34,14 +34,14 @@ import (
 	"github.com/tektoncd/operator/pkg/reconciler/openshift/tektonconfig/extension"
 	"github.com/tektoncd/operator/pkg/reconciler/shared/hash"
 	pac "github.com/tektoncd/operator/pkg/reconciler/shared/tektonconfig/pipelinesascode"
+	"github.com/tektoncd/operator/pkg/reconciler/shared/tektonconfig/sharedresource"
+	"github.com/tektoncd/operator/pkg/reconciler/shared/tektonconfig/shipwrightbuild"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	nsV1 "k8s.io/client-go/informers/core/v1"
-	rbacV1 "k8s.io/client-go/informers/rbac/v1"
 	"k8s.io/client-go/kubernetes"
 	kubeclient "knative.dev/pkg/client/injection/kube/client"
 	namespaceinformer "knative.dev/pkg/client/injection/kube/informers/core/v1/namespace"
-	rbacInformer "knative.dev/pkg/client/injection/kube/informers/rbac/v1/clusterrolebinding"
 	"knative.dev/pkg/logging"
 )
 
@@ -59,7 +59,6 @@ func OpenShiftExtension(ctx context.Context) common.Extension {
 	ext := openshiftExtension{
 		operatorClientSet:  operatorclient.Get(ctx),
 		kubeClientSet:      kubeclient.Get(ctx),
-		rbacInformer:       rbacInformer.Get(ctx),
 		nsInformer:         namespaceinformer.Get(ctx),
 		securityClientSet:  pkgCommon.GetSecurityClient(ctx),
 		tektonConfigLister: tektonConfiginformer.Get(ctx).Lister(),
@@ -79,7 +78,6 @@ func OpenShiftExtension(ctx context.Context) common.Extension {
 type openshiftExtension struct {
 	operatorClientSet       versioned.Interface
 	kubeClientSet           kubernetes.Interface
-	rbacInformer            rbacV1.ClusterRoleBindingInformer
 	nsInformer              nsV1.NamespaceInformer
 	consolePluginReconciler *consolePluginReconciler
 
@@ -105,14 +103,9 @@ func (oe openshiftExtension) PreReconcile(ctx context.Context, tc v1alpha1.Tekto
 		kubeClientSet:     oe.kubeClientSet,
 		operatorClientSet: oe.operatorClientSet,
 		securityClientSet: oe.securityClientSet,
-		rbacInformer:      oe.rbacInformer,
-		nsInformer:        oe.nsInformer,
 		version:           os.Getenv(versionKey),
 		tektonConfig:      config,
 	}
-
-	// set openshift specific defaults
-	r.setDefault()
 
 	// below code helps to retain state of pre-existing SA at the time of upgrade
 	if existingSAWithOwnerRef(r.tektonConfig) {
@@ -150,32 +143,12 @@ func (oe openshiftExtension) PreReconcile(ctx context.Context, tc v1alpha1.Tekto
 		logger.Infof("Successfully patched TektonConfig with serviceAccountCreationLabel set to true")
 	}
 
-	for _, v := range config.Spec.Params {
-		// check for param name and if its matches to createRbacResource
-		// then disable auto creation of RBAC resources by deleting installerSet
-		if v.Name == rbacParamName && v.Value == "false" {
-			if err := deleteInstallerSet(ctx, r.operatorClientSet, r.tektonConfig, componentNameRBAC); err != nil {
-				return err
-			}
-			// remove openshift-pipelines.tekton.dev/namespace-reconcile-version label from namespaces while deleting RBAC resources.
-			if err := r.cleanUp(ctx); err != nil {
-				return err
-			}
-		}
-	}
-
-	// TODO: Remove this after v0.55.0 release, by following a depreciation notice
-	// --------------------
-	if err := r.cleanUpRBACNameChange(ctx); err != nil {
-		return err
-	}
-	// --------------------
-
 	// Resolve the central TLS profile once per reconcile cycle and cache it in the
 	// console plugin reconciler. PostReconcile consumes the cached value without
 	// re-reading the APIServer. The APIServer watch in controller.go ensures that
 	// a TLS profile change triggers a new reconcile, so the cache is always fresh.
-	if config.Spec.Platforms.OpenShift.EnableCentralTLSConfig != nil &&
+	if config.Spec.Platforms.OpenShift != nil &&
+		config.Spec.Platforms.OpenShift.EnableCentralTLSConfig != nil &&
 		*config.Spec.Platforms.OpenShift.EnableCentralTLSConfig {
 		tlsConfig, err := occommon.ResolveCentralTLSToEnvVars(ctx, oe.tektonConfigLister)
 		if err != nil {
@@ -187,11 +160,24 @@ func (oe openshiftExtension) PreReconcile(ctx context.Context, tc v1alpha1.Tekto
 		oe.consolePluginReconciler.SetTLSConfig(nil)
 	}
 
+	if occommon.IsMetricsMTLSEnabled(oe.tektonConfigLister) {
+		if err := occommon.EnsureMetricsClientCA(ctx, oe.kubeClientSet, tc.GetSpec().GetTargetNamespace()); err != nil {
+			return err
+		}
+	}
+
 	return r.createResources(ctx)
 }
 
 func (oe openshiftExtension) PostReconcile(ctx context.Context, comp v1alpha1.TektonComponent) error {
 	configInstance := comp.(*v1alpha1.TektonConfig)
+
+	// Propagate platform-data-hash to any existing ManualApprovalGate CR.
+	// ManualApprovalGate is a standalone CR (not created by TektonConfig — see
+	// https://github.com/tektoncd/operator/issues/3656), so it never receives
+	// platform-data-hash through the normal child-CR path.
+	//
+	oe.propagateMAGPlatformData(ctx)
 
 	if configInstance.Spec.Profile == v1alpha1.ProfileAll {
 		if _, err := extension.EnsureTektonAddonExists(ctx, oe.operatorClientSet.OperatorV1alpha1().TektonAddons(), configInstance, oe.operatorVersion); err != nil {
@@ -217,14 +203,38 @@ func (oe openshiftExtension) PostReconcile(ctx context.Context, comp v1alpha1.Te
 		}
 	}
 
-	// Propagate platform-data-hash to any existing ManualApprovalGate CR.
-	// ManualApprovalGate is a standalone CR (not created by TektonConfig — see
-	// https://github.com/tektoncd/operator/issues/3656), so it never receives
-	// platform-data-hash through the normal child-CR path. We update it here
-	// (same PostReconcile layer as PAC) so that the MAG controller re-applies
-	// the webhook deployment with updated TLS env vars when the cluster TLS
-	// profile changes.
-	oe.propagateMAGPlatformData(ctx)
+	// Reconcile the ShipwrightBuild CR from TektonConfig: create/update it when the
+	// component is enabled, otherwise remove it so TektonConfig stays the single
+	// source of truth for which openshift-builds components are installed.
+	if shipwrightbuild.IsEnabled(configInstance) {
+		if _, err := shipwrightbuild.CreateOrUpdate(ctx, oe.operatorClientSet.OperatorV1alpha1().ShipwrightBuilds(), configInstance, oe.operatorVersion, oe.GetPlatformData()); err != nil {
+			message := fmt.Sprintf("ShipwrightBuild: %s", err.Error())
+			configInstance.Status.MarkComponentNotReady(message)
+			return v1alpha1.REQUEUE_EVENT_AFTER
+		}
+	} else {
+		if err := shipwrightbuild.DeleteIfExists(ctx, oe.operatorClientSet.OperatorV1alpha1().ShipwrightBuilds()); err != nil {
+			message := fmt.Sprintf("ShipwrightBuild: %s", err.Error())
+			configInstance.Status.MarkComponentNotReady(message)
+			return v1alpha1.REQUEUE_EVENT_AFTER
+		}
+	}
+
+	// Reconcile the SharedResource CR from TektonConfig, mirroring the enable/disable
+	// handling above.
+	if sharedresource.IsEnabled(configInstance) {
+		if _, err := sharedresource.CreateOrUpdate(ctx, oe.operatorClientSet.OperatorV1alpha1().SharedResources(), configInstance, configInstance.Status.Version, oe.GetPlatformData()); err != nil {
+			message := fmt.Sprintf("SharedResource: %s", err.Error())
+			configInstance.Status.MarkComponentNotReady(message)
+			return v1alpha1.REQUEUE_EVENT_AFTER
+		}
+	} else {
+		if err := sharedresource.DeleteIfExists(ctx, oe.operatorClientSet.OperatorV1alpha1().SharedResources()); err != nil {
+			message := fmt.Sprintf("SharedResource: %s", err.Error())
+			configInstance.Status.MarkComponentNotReady(message)
+			return v1alpha1.REQUEUE_EVENT_AFTER
+		}
+	}
 
 	// execute console plugin reconciler
 	// TLS config was already resolved and cached in PreReconcile via SetTLSConfig.
@@ -261,19 +271,53 @@ func (oe openshiftExtension) propagateMAGPlatformData(ctx context.Context) {
 }
 
 func (oe openshiftExtension) GetPlatformData() string {
-	tc, err := oe.tektonConfigLister.Get("config")
+	// Use a direct API call (not the lister) so that changes to enableMetricsMTLS
+	// are reflected immediately. The lister can lag behind after the user patches
+	// TektonConfig, causing GetPlatformData to return a stale hash and leaving
+	// component CRs with an incorrect platform-data-hash annotation.
+	ctx := context.Background()
+	tc, err := oe.operatorClientSet.OperatorV1alpha1().TektonConfigs().Get(ctx, v1alpha1.ConfigResourceName, metav1.GetOptions{})
 	if err != nil {
 		return ""
 	}
-	if tc.Spec.Platforms.OpenShift.EnableCentralTLSConfig != nil &&
-		!*tc.Spec.Platforms.OpenShift.EnableCentralTLSConfig {
+
+	// Collect the TLS profile only when central TLS config is not explicitly disabled.
+	var tlsProfile interface{}
+	tlsDisabled := tc.Spec.Platforms.OpenShift != nil &&
+		tc.Spec.Platforms.OpenShift.EnableCentralTLSConfig != nil &&
+		!*tc.Spec.Platforms.OpenShift.EnableCentralTLSConfig
+	if !tlsDisabled {
+		if profile, err := occommon.GetTLSProfileFromAPIServer(ctx); err == nil {
+			tlsProfile = profile
+		}
+	}
+
+	// Read the synced CA bundle so that when TektonConfig creates/rotates
+	// metrics-client-ca the hash changes and all component CRs get their
+	// annotation bumped, immediately triggering their reconcilers.
+	var metricsCABundle string
+	if tc.Spec.Platforms.OpenShift != nil &&
+		tc.Spec.Platforms.OpenShift.EnableMetricsMTLS != nil && *tc.Spec.Platforms.OpenShift.EnableMetricsMTLS {
+		if cm, err := oe.kubeClientSet.CoreV1().ConfigMaps(tc.GetSpec().GetTargetNamespace()).Get(
+			ctx, occommon.MetricsClientCAConfigMap, metav1.GetOptions{}); err == nil {
+			metricsCABundle = cm.Data[occommon.MetricsClientCAKey]
+		}
+	}
+
+	// Return "" when all OpenShift platform settings are at their defaults so
+	// that components without a platform-data-hash annotation are not
+	// unnecessarily re-reconciled on upgrade.
+	if tlsProfile == nil && metricsCABundle == "" {
 		return ""
 	}
-	profile, err := occommon.GetTLSProfileFromAPIServer(context.Background())
-	if err != nil || profile == nil {
-		return ""
-	}
-	h, err := hash.Compute(profile)
+
+	h, err := hash.Compute(struct {
+		TLSProfile      interface{}
+		MetricsCABundle string
+	}{
+		TLSProfile:      tlsProfile,
+		MetricsCABundle: metricsCABundle,
+	})
 	if err != nil {
 		return ""
 	}
@@ -290,6 +334,20 @@ func (oe openshiftExtension) Finalize(ctx context.Context, comp v1alpha1.TektonC
 	pacSpec := configInstance.Spec.PipelinesAsCodeForCurrentPlatform()
 	if pacSpec != nil && pacSpec.Enable != nil && *pacSpec.Enable {
 		if err := pac.EnsureOpenShiftPipelinesAsCodeCRNotExists(ctx, oe.operatorClientSet.OperatorV1alpha1().OpenShiftPipelinesAsCodes()); err != nil {
+			return err
+		}
+	}
+
+	// On TektonConfig teardown, remove the shipwright-build CRs it owns.
+	if shipwrightbuild.IsEnabled(configInstance) {
+		if err := shipwrightbuild.DeleteIfExists(ctx, oe.operatorClientSet.OperatorV1alpha1().ShipwrightBuilds()); err != nil {
+			return err
+		}
+	}
+
+	// On TektonConfig teardown, remove the shared-resource CRs it owns.
+	if sharedresource.IsEnabled(configInstance) {
+		if err := sharedresource.DeleteIfExists(ctx, oe.operatorClientSet.OperatorV1alpha1().SharedResources()); err != nil {
 			return err
 		}
 	}
