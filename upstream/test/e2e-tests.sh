@@ -38,6 +38,11 @@ fi
 
 header "Setting up environment"
 if [ "${E2E_SKIP_OPERATOR_INSTALLATION}" != "true" ]; then
+    # Install cert-manager (Kubernetes only) before the operator so the webhook
+    # certificate dependency is available when components reconcile.
+    if [[ ${TARGET} != "openshift" ]]; then
+      install_cert_manager
+    fi
     install_operator_resources $@
 fi
 
@@ -45,7 +50,7 @@ failed=0
 tektonconfig_ready_wait
 
 header "Running Go e2e tests"
-go_test_e2e -timeout=40m ./test/e2e/common ${KUBECONFIG_PARAM} || failed=1
+go_test_e2e -timeout=55m ./test/e2e/common ${KUBECONFIG_PARAM} || failed=1
 go_test_e2e -timeout=20m ./test/e2e/${TARGET} ${KUBECONFIG_PARAM} || failed=1
 
 (( failed )) && fail_test

@@ -30,13 +30,15 @@ type OperatorV1alpha1Interface interface {
 	RESTClient() rest.Interface
 	ManualApprovalGatesGetter
 	OpenShiftPipelinesAsCodesGetter
+	SharedResourcesGetter
+	ShipwrightBuildsGetter
 	SyncerServicesGetter
 	TektonAddonsGetter
 	TektonChainsGetter
 	TektonConfigsGetter
 	TektonDashboardsGetter
-	TektonHubsGetter
 	TektonInstallerSetsGetter
+	TektonKueuesGetter
 	TektonMulticlusterProxyAAEsGetter
 	TektonPipelinesGetter
 	TektonPrunersGetter
@@ -56,6 +58,14 @@ func (c *OperatorV1alpha1Client) ManualApprovalGates() ManualApprovalGateInterfa
 
 func (c *OperatorV1alpha1Client) OpenShiftPipelinesAsCodes() OpenShiftPipelinesAsCodeInterface {
 	return newOpenShiftPipelinesAsCodes(c)
+}
+
+func (c *OperatorV1alpha1Client) SharedResources() SharedResourceInterface {
+	return newSharedResources(c)
+}
+
+func (c *OperatorV1alpha1Client) ShipwrightBuilds() ShipwrightBuildInterface {
+	return newShipwrightBuilds(c)
 }
 
 func (c *OperatorV1alpha1Client) SyncerServices() SyncerServiceInterface {
@@ -78,12 +88,12 @@ func (c *OperatorV1alpha1Client) TektonDashboards() TektonDashboardInterface {
 	return newTektonDashboards(c)
 }
 
-func (c *OperatorV1alpha1Client) TektonHubs() TektonHubInterface {
-	return newTektonHubs(c)
-}
-
 func (c *OperatorV1alpha1Client) TektonInstallerSets() TektonInstallerSetInterface {
 	return newTektonInstallerSets(c)
+}
+
+func (c *OperatorV1alpha1Client) TektonKueues() TektonKueueInterface {
+	return newTektonKueues(c)
 }
 
 func (c *OperatorV1alpha1Client) TektonMulticlusterProxyAAEs() TektonMulticlusterProxyAAEInterface {

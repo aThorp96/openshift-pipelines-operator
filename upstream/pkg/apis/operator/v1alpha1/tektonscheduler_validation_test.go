@@ -30,6 +30,9 @@ func TestTektonScheduler_Validate(t *testing.T) {
 			Name:      "wrong-name",
 			Namespace: "namespace",
 		},
+		Spec: TektonSchedulerSpec{
+			CommonSpec: CommonSpec{TargetNamespace: "tekton-pipelines"},
+		},
 	}
 	ts.SetDefaults(t.Context())
 
@@ -43,9 +46,10 @@ func TestTektonScheduler_ValidateMultiClusterDisabled(t *testing.T) {
 			Name: "scheduler",
 		},
 		Spec: TektonSchedulerSpec{
+			CommonSpec: CommonSpec{TargetNamespace: "tekton-pipelines"},
 			Scheduler: Scheduler{
 				Disabled: ptr.Bool(false),
-				MultiClusterConfig: MultiClusterConfig{
+				SchedulerMultiClusterConfig: SchedulerMultiClusterConfig{
 					MultiClusterDisabled: true,
 					MultiClusterRole:     "Hub",
 				},
@@ -70,9 +74,10 @@ func TestTektonScheduler_ValidateMultiClusterEnabled(t *testing.T) {
 			Name: "scheduler",
 		},
 		Spec: TektonSchedulerSpec{
+			CommonSpec: CommonSpec{TargetNamespace: "tekton-pipelines"},
 			Scheduler: Scheduler{
 				Disabled: ptr.Bool(false),
-				MultiClusterConfig: MultiClusterConfig{
+				SchedulerMultiClusterConfig: SchedulerMultiClusterConfig{
 					MultiClusterDisabled: false,
 					MultiClusterRole:     "",
 				},
@@ -111,9 +116,10 @@ func TestTektonScheduler_ValidateMultiClusterRoleCaseInsensitive(t *testing.T) {
 					Name: "scheduler",
 				},
 				Spec: TektonSchedulerSpec{
+					CommonSpec: CommonSpec{TargetNamespace: "tekton-pipelines"},
 					Scheduler: Scheduler{
 						Disabled: ptr.Bool(false),
-						MultiClusterConfig: MultiClusterConfig{
+						SchedulerMultiClusterConfig: SchedulerMultiClusterConfig{
 							MultiClusterDisabled: false,
 							MultiClusterRole:     tc.role,
 						},
@@ -127,4 +133,27 @@ func TestTektonScheduler_ValidateMultiClusterRoleCaseInsensitive(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTektonScheduler_ValidateCommonSpec(t *testing.T) {
+	// TektonScheduler embeds CommonSpec, so Validate() must run the common spec
+	// checks. A reserved system namespace must now be rejected.
+	ts := &TektonScheduler{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "scheduler",
+		},
+		Spec: TektonSchedulerSpec{
+			CommonSpec: CommonSpec{TargetNamespace: "kube-system"},
+			Scheduler: Scheduler{
+				Disabled: ptr.Bool(false),
+				SchedulerMultiClusterConfig: SchedulerMultiClusterConfig{
+					MultiClusterDisabled: true,
+				},
+			},
+		},
+	}
+
+	err := ts.Validate(t.Context())
+	assert.ErrorContains(t, err, "spec.targetNamespace")
+	assert.ErrorContains(t, err, "reserved system namespace")
 }
